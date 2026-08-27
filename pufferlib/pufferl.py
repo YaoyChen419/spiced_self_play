@@ -204,7 +204,7 @@ class PuffeRL:
 
         # Learning rate scheduler
         epochs = config["total_timesteps"] // config["batch_size"]
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=lambda epoch: max(0.0,1.0-epoch / max(1,epochs)))
         self.total_epochs = epochs
 
         self.ent_coef_initial = config["ent_coef"]
@@ -1238,6 +1238,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         print(f"rank: {local_rank}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
         torch.cuda.set_device(local_rank)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+
+    # Seed all RNGs before creating the environment and policy
+    seed = args["train"]["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if args["rnn_name"] is None:
         args["env"]["uses_memory"] = False
