@@ -372,7 +372,7 @@ class PuffeRL:
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
                 if l + 1 >= config["bptt_horizon"]:
-                    num_full = env_id.stop - env_id.start
+                    num_full = int(env_id.stop - env_id.start)
                     self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config["device"]).int()
                     self.ep_lengths[env_id] = 0
                     self.free_idx += num_full
@@ -1229,7 +1229,7 @@ class WandbLogger:
 
         run_name = args.get("wandb_run_name", None)
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            id=load_id,
             name=run_name,
             project=args["wandb_project"],
             group=args["wandb_group"],
