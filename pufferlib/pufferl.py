@@ -133,6 +133,8 @@ class PuffeRL:
         # Tracks which agents have hit a terminal and should be ignored until world reset
         self.agent_dead = torch.zeros(total_agents, device=device, dtype=torch.bool)
         self.masks = torch.ones(segments, rollout_horizon, device=device)
+        # Per-transition numerical validity, used only to quarantine corrupted rollout data.
+        self.numeric_valid = torch.ones(segments, rollout_horizon, device=device, dtype=torch.bool)
 
         # LSTM
         if config["use_rnn"]:
@@ -285,8 +287,15 @@ class PuffeRL:
 
             profile("eval_copy", epoch)
             o = torch.as_tensor(o)
+            obs_finite = torch.isfinite(o).reshape(o.shape[0], -1).all(dim=1)
+            if not obs_finite.all().item():
+                o = o.clone()
+                o[~obs_finite] = 0
             o_device = o.to(device)  # , non_blocking=True)
+            obs_finite = obs_finite.to(device)
             r = torch.as_tensor(r).to(device)  # , non_blocking=True)
+            reward_finite = torch.isfinite(r)
+            r = torch.where(reward_finite, r, torch.zeros_like(r))
             d = torch.as_tensor(d).to(device)  # , non_blocking=True)
             t = torch.as_tensor(t).to(device)  # , non_blocking=True)
             done_mask = (d + t).clamp(max=1)
@@ -307,10 +316,17 @@ class PuffeRL:
                 logits, value = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
+                value = value.flatten()
+                step_finite = obs_finite & reward_finite & torch.isfinite(value) & torch.isfinite(logprob)
+                r = torch.where(step_finite, r, torch.zeros_like(r))
+                value = torch.where(step_finite, value, torch.zeros_like(value))
+                logprob = torch.where(step_finite, logprob, torch.zeros_like(logprob))
 
             profile("eval_copy", epoch)
             with torch.no_grad():
                 if config["use_rnn"]:
+                    state["lstm_h"][~step_finite] = 0
+                    state["lstm_c"][~step_finite] = 0
                     self.lstm_h[env_id.start] = state["lstm_h"]
                     self.lstm_c[env_id.start] = state["lstm_c"]
 
@@ -325,6 +341,7 @@ class PuffeRL:
 
                 self.actions[batch_rows, l] = action
                 self.logprobs[batch_rows, l] = logprob
+                self.numeric_valid[batch_rows, l] = step_finite
 
                 # The terminal timestep itself is valid; everything after is not.
                 # We store the mask before updating agent_dead so the terminal step is included.
@@ -350,7 +367,7 @@ class PuffeRL:
                 self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = done_mask.float()
                 self.truncations[batch_rows, l] = t.float()
-                self.values[batch_rows, l] = value.flatten()
+                self.values[batch_rows, l] = value
 
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
@@ -391,14 +408,24 @@ class PuffeRL:
                 device=config["device"],
             )
 
-        # --- Apply post-terminal mask to buffers before training ---
-        # Zero rewards and values for invalid (post-terminal) timesteps
-        self.rewards *= self.masks
-        self.values *= self.masks
-        # Force dones=1 for invalid timesteps so advantage propagation is cut
-        self.terminals[self.masks == 0] = 1.0
+        # Quarantine a corrupted transition and the remainder of its recurrent segment.
+        active_masks = self.masks.bool()
+        quarantine_starts = active_masks & ~self.numeric_valid
+        quarantine_suffix = quarantine_starts.to(torch.int32).cumsum(dim=1) > 0
+        quarantined = quarantine_suffix & active_masks
+        self.masks.masked_fill_(quarantine_suffix, 0.0)
+
+        # Use assignment rather than multiplication: NaN * 0 is still NaN.
+        invalid = ~self.masks.bool()
+        self.rewards.masked_fill_(invalid, 0.0)
+        self.values.masked_fill_(invalid, 0.0)
+        self.logprobs.masked_fill_(invalid, 0.0)
+        self.terminals.masked_fill_(invalid, 1.0)
+        self.stats["numerics/quarantined_transitions"].append(int(quarantined.sum().item()))
+        self.stats["numerics/quarantined_sequences"].append(int(quarantine_starts.any(dim=1).sum().item()))
 
         self.perc_transitions_trained_on = self.masks.mean().item()
+        self.numeric_valid.fill_(True)
 
         # Reset agent_dead for next rollout
         self.agent_dead.zero_()
@@ -647,9 +674,15 @@ class PuffeRL:
 
             # Learn on accumulated minibatches
             profile("learn", epoch)
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Non-finite PPO loss at epoch={epoch}, minibatch={mb}")
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(),
+                    config["max_grad_norm"],
+                    error_if_nonfinite=True,
+                )
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
