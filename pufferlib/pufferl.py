@@ -35,6 +35,7 @@ import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
+from pufferlib.ppo_window_diagnostics import PPOWindowDiagnostics
 
 from pufferlib.ocean.benchmark.evaluator import Evaluator
 
@@ -425,6 +426,7 @@ class PuffeRL:
         vf_clip = config["vf_clip_coef"]
         anneal_beta = b0 + (1 - b0) * a * self.epoch / self.total_epochs
         self.ratio[:] = 1
+        diagnostics = getattr(self, "diagnostics", None)
 
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
@@ -449,6 +451,8 @@ class PuffeRL:
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            if diagnostics is not None:
+                diagnostics.record_minibatch(mb, idx)
             mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
@@ -647,10 +651,31 @@ class PuffeRL:
 
             # Learn on accumulated minibatches
             profile("learn", epoch)
+            if diagnostics is not None:
+                diagnostics.check_pre_backward(
+                    mb,
+                    [
+                        ("loss", loss),
+                        ("policy_loss", pg_loss),
+                        ("value_loss", v_loss),
+                        ("entropy_loss", entropy_loss),
+                        ("newlogprob", newlogprob),
+                        ("newvalue", newvalue),
+                        ("logratio", logratio),
+                        ("ratio", ratio),
+                        ("advantages", adv),
+                    ],
+                )
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), config["max_grad_norm"]
+                )
+                if diagnostics is not None:
+                    diagnostics.check_gradients(mb, grad_norm)
                 self.optimizer.step()
+                if diagnostics is not None:
+                    diagnostics.check_post_step(mb)
                 self.optimizer.zero_grad()
 
         # Reprioritize experience
@@ -1274,15 +1299,26 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}))
     pufferl = PuffeRL(train_config, vecenv, policy, logger, full_args=args)
+    diagnostics = PPOWindowDiagnostics(pufferl)
+    pufferl.diagnostics = None
 
     all_logs = []
     while pufferl.global_step < train_config["total_timesteps"]:
+        diagnostics.capture_epoch_boundary()
         if train_config["device"] == "cuda":
             torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
+        diagnostics.begin_update()
+        if diagnostics.active:
+            pufferl.diagnostics = diagnostics
+            diagnostics.check_rollout()
+        else:
+            pufferl.diagnostics = None
         if train_config["device"] == "cuda":
             torch.compiler.cudagraph_mark_step_begin()
         logs = pufferl.train()
+        pufferl.diagnostics = None
+        diagnostics.end_update()
 
         if logs is not None:
             if pufferl.global_step > 0.20 * train_config["total_timesteps"]:
