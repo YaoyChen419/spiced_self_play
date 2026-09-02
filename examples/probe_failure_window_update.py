@@ -507,7 +507,7 @@ def main():
             if args.target_start <= offset <= args.target_end:
                 timestep = offset - args.target_start
                 observations[ids, timestep] = observation_t
-                actions[ids, timestep] = action
+                actions[ids, timestep] = action.to(dtype=actions.dtype)
                 logprobs[ids, timestep] = logprob
 
                 terminal_flag = (terminal_t > 0) & (truncation_t == 0)
