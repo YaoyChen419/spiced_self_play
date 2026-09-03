@@ -96,6 +96,8 @@ def parse_args():
         default=None,
     )
     parser.add_argument("--trace-policy-boundary", action="store_true")
+    parser.add_argument("--disable-compile", action="store_true")
+    parser.add_argument("--disable-cudnn", action="store_true")
     return parser.parse_args()
 
 
@@ -134,6 +136,10 @@ def main():
     config["load_id"] = None
     config["load_model_path"] = None
     config["train"]["device"] = "cuda"
+    if args.disable_compile:
+        config["train"]["compile"] = False
+    if args.disable_cudnn:
+        torch.backends.cudnn.enabled = False
 
     seed = config["train"]["seed"]
     random.seed(seed)
@@ -160,9 +166,16 @@ def main():
     result = {
         "status": "started",
         "compile_mode": train_config["compile_mode"],
+        "compile_enabled": train_config["compile"],
+        "cudnn_enabled": torch.backends.cudnn.enabled,
         "warmup": "one official evaluate/train update",
         "optimizer_step_on_failure_data": False,
     }
+    print(
+        f"BACKEND_CONFIG compile={train_config['compile']} "
+        f"cudnn={torch.backends.cudnn.enabled}",
+        flush=True,
+    )
 
     try:
         # Match the official call order that created and reused the compiled
