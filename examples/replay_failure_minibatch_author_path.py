@@ -1,0 +1,190 @@
+import argparse
+import copy
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from examples.analyze_failure_minibatch import (
+    gradient_report,
+    restore_rng,
+    tensor_report,
+)
+
+
+class StopBeforeClip(Exception):
+    pass
+
+
+class FirstMinibatchProbe:
+    def __init__(self, expected_indices):
+        self.expected_indices = expected_indices.cpu().long()
+        self.indices_match = None
+        self.pre_backward = None
+
+    def record_minibatch(self, minibatch, indices):
+        if minibatch != 0:
+            raise RuntimeError("Replay reached an unexpected second minibatch")
+        actual = indices.detach().cpu().long()
+        self.indices_match = torch.equal(actual, self.expected_indices)
+        if not self.indices_match:
+            raise RuntimeError("Replayed minibatch indices do not match the crash bundle")
+
+    def check_pre_backward(self, minibatch, named_values):
+        if minibatch != 0:
+            raise RuntimeError("Unexpected minibatch in pre-backward probe")
+        self.pre_backward = {
+            name: tensor_report(name, value) for name, value in named_values
+        }
+
+    def check_gradients(self, minibatch, grad_norm):
+        raise RuntimeError("Gradient probe did not intercept clip_grad_norm_")
+
+    def check_post_step(self, minibatch):
+        raise RuntimeError("optimizer.step() must not run during replay")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--last-good", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def copy_tensor(destination, source):
+    destination.copy_(source.to(device=destination.device, dtype=destination.dtype))
+
+
+def main():
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+
+    from pufferlib import pufferl
+
+    bundle = torch.load(
+        args.bundle, map_location="cpu", weights_only=False, mmap=True
+    )
+    last_good = torch.load(
+        args.last_good, map_location="cpu", weights_only=False, mmap=True
+    )
+    config = copy.deepcopy(bundle["full_args"])
+    config["wandb"] = False
+    config["neptune"] = False
+    config["load_id"] = None
+    config["load_model_path"] = None
+    config["train"]["device"] = "cuda"
+
+    seed = config["train"]["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if config["rnn_name"] is None:
+        config["env"]["uses_memory"] = False
+        config["env"]["memory_size"] = 0
+    else:
+        config["env"]["uses_memory"] = True
+        config["env"]["memory_size"] = config["train"]["rollout_horizon"]
+
+    vecenv = pufferl.load_env("puffer_drive", config)
+    policy = pufferl.load_policy(config, vecenv, "puffer_drive")
+    train_config = dict(
+        **config["train"], env="puffer_drive", eval=config.get("eval", {})
+    )
+    trainer = pufferl.PuffeRL(
+        train_config, vecenv, policy, logger=None, full_args=config
+    )
+    trainer.diagnostics = None
+
+    result = {
+        "status": "started",
+        "compile_mode": train_config["compile_mode"],
+        "warmup": "one official evaluate/train update",
+        "optimizer_step_on_failure_data": False,
+    }
+
+    try:
+        # Match the official call order that created and reused the compiled
+        # eval, policy, and action-distribution graphs from epoch one onward.
+        torch.compiler.cudagraph_mark_step_begin()
+        trainer.evaluate()
+        torch.compiler.cudagraph_mark_step_begin()
+        trainer.train()
+        print("AUTHOR_PATH_WARMUP_PASSED", flush=True)
+
+        trainer.uncompiled_policy.load_state_dict(last_good["model_state_dict"])
+        trainer.optimizer.load_state_dict(last_good["optimizer_state_dict"])
+        trainer.scheduler.load_state_dict(last_good["scheduler_state_dict"])
+        trainer.optimizer.zero_grad(set_to_none=True)
+        trainer.epoch = int(bundle["failure"]["internal_epoch"])
+        trainer.global_step = int(last_good["global_step"])
+
+        for name in (
+            "observations",
+            "actions",
+            "logprobs",
+            "rewards",
+            "terminals",
+            "truncations",
+            "masks",
+        ):
+            copy_tensor(getattr(trainer, name), bundle["buffers"][name])
+        copy_tensor(trainer.values, bundle["initial_values"])
+
+        model_equal = all(
+            torch.equal(
+                value.detach().cpu(), last_good["model_state_dict"][name]
+            )
+            for name, value in trainer.uncompiled_policy.state_dict().items()
+        )
+        if not model_equal:
+            raise RuntimeError("Restored model does not exactly match last-good")
+
+        expected_indices = bundle["minibatch_indices"][0]["indices"]
+        probe = FirstMinibatchProbe(expected_indices)
+        trainer.diagnostics = probe
+        restore_rng(bundle["pre_update_rng"], "cuda")
+
+        original_clip = torch.nn.utils.clip_grad_norm_
+
+        def intercept_clip(parameters, max_norm, *clip_args, **clip_kwargs):
+            raw_gradients = gradient_report(trainer.uncompiled_policy)
+            result["raw_gradients_before_clip"] = raw_gradients
+            result["first_raw_nonfinite"] = raw_gradients["first_nonfinite"]
+            raise StopBeforeClip
+
+        torch.nn.utils.clip_grad_norm_ = intercept_clip
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+            trainer.train()
+            raise RuntimeError("Replay unexpectedly completed an optimizer update")
+        except StopBeforeClip:
+            result["indices_match"] = probe.indices_match
+            result["pre_backward"] = probe.pre_backward
+            result["status"] = "nonfinite" if result["first_raw_nonfinite"] else "finite"
+        finally:
+            torch.nn.utils.clip_grad_norm_ = original_clip
+
+        print("INDICES_MATCH =", result["indices_match"], flush=True)
+        print("RAW_GRADIENTS =", result["raw_gradients_before_clip"], flush=True)
+        print("AUTHOR_PATH_STATUS =", result["status"], flush=True)
+    finally:
+        try:
+            vecenv.close()
+        finally:
+            trainer.utilization.stop()
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print("output =", args.output, flush=True)
+    print("AUTHOR_PATH_REPLAY_PASSED", flush=True)
+
+
+if __name__ == "__main__":
+    main()
