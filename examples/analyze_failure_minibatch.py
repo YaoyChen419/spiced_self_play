@@ -133,7 +133,9 @@ def compute_advantages(bundle, config, device):
     values = bundle["initial_values"].detach().clone().to(device)
     rewards = bundle["buffers"]["rewards"].detach().clone().to(device)
     terminals = bundle["buffers"]["terminals"].detach().clone().to(device)
-    ratio = bundle["initial_ratio"].detach().clone().to(device)
+    # PuffeRL resets the rollout importance ratios at the start of every
+    # train() call, before computing the first minibatch advantages.
+    ratio = torch.ones_like(values)
     advantages = torch.zeros_like(values)
 
     previous = pufferl.ADVANTAGE_CUDA
