@@ -71,6 +71,9 @@ class FirstMinibatchProbe:
             "raw_gradients_before_clip": gradient_report(
                 self.trainer.uncompiled_policy
             ),
+            "parameter_gradients": parameter_gradient_reports(
+                self.trainer.uncompiled_policy
+            ),
         }
         raise ComponentBackwardComplete
 
@@ -98,6 +101,18 @@ def parse_args():
 
 def copy_tensor(destination, source):
     destination.copy_(source.to(device=destination.device, dtype=destination.dtype))
+
+
+def parameter_gradient_reports(policy):
+    reports = {}
+    for name, parameter in policy.named_parameters():
+        if parameter.grad is None:
+            reports[name] = {"has_gradient": False}
+            continue
+        report = tensor_report(f"gradient.{name}", parameter.grad)
+        report["has_gradient"] = True
+        reports[name] = report
+    return reports
 
 
 def main():
@@ -259,6 +274,16 @@ def main():
                     f"GRADIENTS={component_result['raw_gradients_before_clip']}",
                     flush=True,
                 )
+                for name, report in component_result[
+                    "parameter_gradients"
+                ].items():
+                    print(
+                        f"PARAM_GRAD component={component} name={name} "
+                        f"finite={report.get('finite')} "
+                        f"nan_count={report.get('nan_count', 0)} "
+                        f"max_abs={report.get('finite_max_abs')}",
+                        flush=True,
+                    )
 
             result["status"] = "components_complete"
             print("AUTHOR_PATH_STATUS = components_complete", flush=True)
