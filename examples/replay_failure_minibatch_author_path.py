@@ -98,6 +98,8 @@ def parse_args():
     parser.add_argument("--trace-policy-boundary", action="store_true")
     parser.add_argument("--disable-compile", action="store_true")
     parser.add_argument("--disable-cudnn", action="store_true")
+    parser.add_argument("--disable-cudnn-benchmark", action="store_true")
+    parser.add_argument("--disable-cudnn-tf32", action="store_true")
     return parser.parse_args()
 
 
@@ -162,18 +164,26 @@ def main():
         train_config, vecenv, policy, logger=None, full_args=config
     )
     trainer.diagnostics = None
+    if args.disable_cudnn_benchmark:
+        torch.backends.cudnn.benchmark = False
+    if args.disable_cudnn_tf32:
+        torch.backends.cudnn.allow_tf32 = False
 
     result = {
         "status": "started",
         "compile_mode": train_config["compile_mode"],
         "compile_enabled": train_config["compile"],
         "cudnn_enabled": torch.backends.cudnn.enabled,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "warmup": "one official evaluate/train update",
         "optimizer_step_on_failure_data": False,
     }
     print(
         f"BACKEND_CONFIG compile={train_config['compile']} "
-        f"cudnn={torch.backends.cudnn.enabled}",
+        f"cudnn={torch.backends.cudnn.enabled} "
+        f"benchmark={torch.backends.cudnn.benchmark} "
+        f"allow_tf32={torch.backends.cudnn.allow_tf32}",
         flush=True,
     )
 
