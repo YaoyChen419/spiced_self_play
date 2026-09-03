@@ -92,6 +92,7 @@ def parse_args():
         choices=("policy", "value", "entropy", "total"),
         default=None,
     )
+    parser.add_argument("--trace-policy-boundary", action="store_true")
     return parser.parse_args()
 
 
@@ -156,6 +157,39 @@ def main():
         torch.compiler.cudagraph_mark_step_begin()
         trainer.train()
         print("AUTHOR_PATH_WARMUP_PASSED", flush=True)
+
+        original_sample_logits = None
+        if args.trace_policy_boundary:
+            import pufferlib.pytorch
+
+            original_sample_logits = pufferlib.pytorch.sample_logits
+            boundary = {}
+            result["policy_boundary"] = boundary
+
+            def capture_gradient(name):
+                def hook(gradient):
+                    boundary[name] = tensor_report(name, gradient)
+                    return gradient
+
+                return hook
+
+            def traced_sample_logits(logits, action=None):
+                outputs = original_sample_logits(logits, action=action)
+                if action is not None:
+                    heads = [logits] if torch.is_tensor(logits) else logits
+                    for index, head in enumerate(heads):
+                        boundary[f"logits_head_{index}_forward"] = (
+                            tensor_report(f"logits_head_{index}", head)
+                        )
+                        head.register_hook(
+                            capture_gradient(f"logits_head_{index}_gradient")
+                        )
+                    outputs[1].register_hook(
+                        capture_gradient("newlogprob_gradient")
+                    )
+                return outputs
+
+            pufferlib.pytorch.sample_logits = traced_sample_logits
 
         expected_indices = bundle["minibatch_indices"][0]["indices"]
 
@@ -267,6 +301,9 @@ def main():
                 flush=True,
             )
             print("AUTHOR_PATH_STATUS =", result["status"], flush=True)
+        if args.trace_policy_boundary:
+            print("POLICY_BOUNDARY =", result["policy_boundary"], flush=True)
+            pufferlib.pytorch.sample_logits = original_sample_logits
     finally:
         try:
             vecenv.close()
