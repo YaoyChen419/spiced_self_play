@@ -100,6 +100,7 @@ def parse_args():
     parser.add_argument("--disable-cudnn", action="store_true")
     parser.add_argument("--disable-cudnn-benchmark", action="store_true")
     parser.add_argument("--disable-cudnn-tf32", action="store_true")
+    parser.add_argument("--cudnn-deterministic", action="store_true")
     return parser.parse_args()
 
 
@@ -168,6 +169,8 @@ def main():
         torch.backends.cudnn.benchmark = False
     if args.disable_cudnn_tf32:
         torch.backends.cudnn.allow_tf32 = False
+    if args.cudnn_deterministic:
+        torch.backends.cudnn.deterministic = True
 
     result = {
         "status": "started",
@@ -176,6 +179,7 @@ def main():
         "cudnn_enabled": torch.backends.cudnn.enabled,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "warmup": "one official evaluate/train update",
         "optimizer_step_on_failure_data": False,
     }
@@ -183,7 +187,8 @@ def main():
         f"BACKEND_CONFIG compile={train_config['compile']} "
         f"cudnn={torch.backends.cudnn.enabled} "
         f"benchmark={torch.backends.cudnn.benchmark} "
-        f"allow_tf32={torch.backends.cudnn.allow_tf32}",
+        f"allow_tf32={torch.backends.cudnn.allow_tf32} "
+        f"deterministic={torch.backends.cudnn.deterministic}",
         flush=True,
     )
 
