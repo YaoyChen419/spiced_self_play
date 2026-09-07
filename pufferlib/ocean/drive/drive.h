@@ -535,6 +535,7 @@ struct Drive {
     float *rewards;
     unsigned char *terminals;
     unsigned char *truncations;
+    float *final_observations; // Optional caller-owned pre-reset observations for replay learners.
     Log log;
     Log *logs;
     int num_agents;
@@ -2804,6 +2805,14 @@ void c_step(Drive *env) {
             env->truncations[i] = 1;
         }
         add_log(env);
+        if (env->final_observations) {
+            compute_observations(env);
+            int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
+            int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
+                          ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+            memcpy(env->final_observations, env->observations,
+                   env->active_agent_count * obs_dim * sizeof(float));
+        }
         if (env->async_resets) {
             // printf("[async_resets=1] Episode done at t=%d, resetting\n", env->timestep);
             c_reset(env);

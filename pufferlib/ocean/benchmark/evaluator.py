@@ -237,7 +237,8 @@ class WOSACEvaluator:
                         with torch.no_grad():
                             ob_tensor = torch.as_tensor(obs).to(device)
                             logits, value = policy.forward_eval(ob_tensor, state)
-                            action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                            action = (logits if getattr(policy, 'is_deterministic', False)
+                                      else pufferlib.pytorch.sample_logits(logits)[0])
                             action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
                         if isinstance(logits, torch.distributions.Normal):
@@ -957,7 +958,8 @@ class Evaluator:
             with torch.no_grad():
                 ob_tensor = torch.as_tensor(obs).to(device)
                 logits, value = policy.forward_eval(ob_tensor, state)
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                action = (logits if getattr(policy, 'is_deterministic', False)
+                          else pufferlib.pytorch.sample_logits(logits)[0])
                 action_np = action.cpu().numpy().reshape(env.action_space.shape)
 
             # Clip continuous actions to valid range

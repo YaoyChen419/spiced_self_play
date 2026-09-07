@@ -41,9 +41,7 @@ from pufferlib.ocean.benchmark.evaluator import Evaluator
 try:
     from pufferlib import _C
 except ImportError:
-    raise ImportError(
-        "Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation"
-    )
+    _C = None  # Only PPO requires the advantage kernel.
 
 import rich
 import rich.traceback
@@ -1227,6 +1225,11 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
+    if args.get('algorithm', 'ppo') == 'fasttd3':
+        from pufferlib.fasttd3_train import train as train_fasttd3
+        return train_fasttd3(env_name, args, vecenv, policy, logger)
+    if _C is None:
+        raise ImportError('PPO requires the C/CUDA advantage kernel; rebuild with --no-build-isolation')
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
     if "LOCAL_RANK" in os.environ:
@@ -1392,7 +1395,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 ob = torch.as_tensor(ob).to(device)
                 logits, value = policy.forward_eval(ob, state)
 
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                action = (logits if getattr(policy, 'is_deterministic', False)
+                          else pufferlib.pytorch.sample_logits(logits)[0])
 
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
@@ -1734,6 +1738,20 @@ def _load_state_dict(checkpoint, device):
 
 
 def load_policy(args, vecenv, env_name=""):
+    if args.get('algorithm', 'ppo') == 'fasttd3':
+        from pufferlib.fasttd3 import RecurrentActor
+        if args['env']['action_type'] != 'continuous':
+            raise ValueError('FastTD3 evaluation requires --env.action-type continuous')
+        policy = RecurrentActor(vecenv.driver_env, args).to(args['train']['device'])
+        if args.get('load_id'):
+            raise ValueError('Use --load-model-path for FastTD3 checkpoints')
+        path = args.get('load_model_path')
+        if path:
+            checkpoint = torch.load(path, map_location=args['train']['device'], weights_only=False)
+            if checkpoint.get('algorithm') != 'fasttd3':
+                raise ValueError('Expected a FastTD3 checkpoint, not a PPO or BC model')
+            policy.load_state_dict(checkpoint['model_state_dict'])
+        return policy
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
@@ -1783,6 +1801,7 @@ def load_config(env_name, config_dir=None):
         add_help=False,
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
+    parser.add_argument('--algorithm', choices=('ppo', 'fasttd3'), default='ppo')
     parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"
     )
