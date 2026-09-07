@@ -215,7 +215,8 @@ class Drive(pufferlib.PufferEnv):
             else:
                 raise ValueError(f"dynamics_model must be 'classic', 'delta_local' or 'jerk'. Got: {dynamics_model}")
         elif action_type == "continuous":
-            self.single_action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+            action_dim = 3 if dynamics_model == "delta_local" else 2
+            self.single_action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(action_dim,), dtype=np.float32)
         else:
             raise ValueError(f"action_space must be 'discrete' or 'continuous'. Got: {action_type}")
 
