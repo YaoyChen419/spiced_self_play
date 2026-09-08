@@ -1389,7 +1389,10 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             frame_count = 0
 
         while True:
-            driver.render(env_id=0)
+            if env_name == 'puffer_drive':
+                driver.render(env_idx=0)
+            else:
+                driver.render(env_id=0)
 
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
@@ -1403,7 +1406,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             if isinstance(logits, torch.distributions.Normal):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
-            obs, reward, terminal, truncated, info = vecenv.step(action)
+            ob, reward, terminal, truncated, info = vecenv.step(action)
 
             if driver.render_mode == 1:
                 frame_count += 1

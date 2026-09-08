@@ -902,7 +902,7 @@ class Evaluator:
         needs_stats_first = render_eval and self.render_select_mode not in (self.RENDER_FIRST, self.RENDER_RANDOM)
 
         if needs_stats_first:
-            env_logs = self._run_rollout(policy, env, per_env_logs=True)
+            env_logs = self._run_rollout(policy, env, mode, per_env_logs=True)
             render_env_idx = self.select_render_env(env_logs)
 
         else:
@@ -919,10 +919,12 @@ class Evaluator:
 
         if mode == "self_play":
             self.self_play_stats = env_statistics
-            self.self_play_stats[0]["render_env_idx"] = render_env_idx
+            if self.self_play_stats:
+                self.self_play_stats[0]["render_env_idx"] = render_env_idx
         elif mode == "human_replay":
             self.human_replay_stats = env_statistics
-            self.human_replay_stats[0]["render_env_idx"] = render_env_idx
+            if self.human_replay_stats:
+                self.human_replay_stats[0]["render_env_idx"] = render_env_idx
 
     def _run_rollout(self, policy, env, mode, render_env_idx=None, per_env_logs=False, view_mode=None):
         """Run a single rollout. If render_env_idx is not None, render that env."""
@@ -949,7 +951,7 @@ class Evaluator:
 
         info_list = []
         for time_idx in range(self.sim_steps):
-            if mode == "human_replay" and not terminals[render_env_idx]:
+            if mode == "human_replay" and render_env_idx is not None and not terminals[render_env_idx]:
                 driver.render(view_mode=view_mode, env_idx=render_env_idx)
             elif mode == "self_play" and render_env_idx is not None:
                 driver.render(view_mode=view_mode, env_idx=render_env_idx)

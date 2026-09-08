@@ -9,7 +9,7 @@
 - PPO 的 GAE、裁剪目标、熵奖励和 value loss 被回放学习、分布式 Q 目标及确定性策略梯度替代。PPO 专属优化参数不再适用。
 - FastTD3 使用当前 actor 计算下一动作，不另建 target actor；每次 critic 更新都软更新 target critic，每两次 critic 更新更新一次 actor。
 - `[fasttd3]` 单独记录新增参数：actor/critic 学习率均为 3e-4、head 宽度 512/1024、101 atoms、支持区间 [-250, 250]、tau=0.1、探索标准差 [0.001, 0.4]、目标噪声 0.001、噪声裁剪 0.5、CDQ 开启。沿用原作 Adam betas/eps、梯度裁剪和线性学习率衰减开关。
-- 每次接收到一个异步向量批次后执行 2 次 critic 更新；至少接收 10 次且有完成的轨迹后开始学习。`learning_starts` 的单位是接收批次。每次更新采样 `minibatch_size / rollout_horizon` 个序列，微批次 16 个序列并累积梯度；补齐位置不计入损失。记录有效样本数。
+- 每次接收到一个异步向量批次后执行 2 次 critic 更新；至少接收 10 次且有完成的轨迹后开始学习。`learning_starts` 的单位是接收批次。每次更新采样 `minibatch_size / rollout_horizon` 个序列，微批次 16 个序列并累积梯度；补齐位置不计入损失。回合内从 0 开始计数的位置 t，其窗口覆盖次数为 `min(t+1, rollout_horizon)`，actor/critic 损失均乘以该次数的倒数，再除以采样序列总数，使各 transition 在期望中等权。记录有效样本数。
 - CPU 回放容量为 262144 个已完成的 transition，另存尚未结束的轨迹。按车辆和回合隔离，采样连续窗口，并从完整回合前缀重建 LSTM 状态；前缀不反向传播。终止后至场景重置前的数据不入回放。只使用已完成轨迹会使最初的回放偏向短轨迹。
 - 新增可选 `capture_final_observations`：在自动重置/换地图之前保存最后观测和真实 terminal 标志。超时/换地图允许 bootstrap，真实 terminal 不允许；避免将新回合观测错误拼入 TD 目标。PPO 默认不启用。
 - 原评估器识别确定性 actor，直接执行其动作；原 PPO 的动作采样逻辑保留。
@@ -43,3 +43,13 @@ python -m unittest discover -s tests -p test_drive_continuous_actions.py -v
 测试使用随仓库提供的单个 sanity 场景重新序列化，不需要训练数据集。覆盖自动重置前观测、换地图 terminal 区分、回放边界、LSTM 前缀重建、延迟 actor 更新、串行/两个异步工作进程短训练、checkpoint 加载，以及第一阶段连续动作回归。小测试为 CPU 运行；不等同于完整数据集/GPU 性能验证。
 
 提交范围：6 个已有文件（drive.ini、evaluator.py、binding.c、drive.h、drive.py、pufferl.py）和 5 个新增文件（fasttd3.py、fasttd3_train.py、requirements-fasttd3.txt、test_fasttd3.py、本说明）。无需提交编译出的 `.so`、测试依赖、缓存或模型。保留原有文件路径，上传同路径文件会更新对应文件。
+
+## 静态审查后的修复
+
+- 独立 Drive 评估使用正确的 `env_idx` 参数，每一步使用最新返回的观测。
+- 评估器补齐统计预运行的 mode 参数、关闭 human-replay 渲染时的 None 检查和空统计列表保护。
+- FastTD3 在每次评估前保存 checkpoint；评估异常或启用模式缺少成绩时记录 `eval/failed=1` 并打印原因，不沿用旧成绩，不把失败当作零分。训练继续；默认评估与保存周期一致，原周期不变。
+- 回放窗口按覆盖次数补偿权重；新增枚举窗口起点的回归用例。
+- `drive.h`、`binding.c` 恢复原 LF 换行，未改变 C 逻辑。
+
+本轮修复仅做静态检查，未运行新增测试或本地联调。上一版的测试通过记录不能作为本轮运行验证结果。

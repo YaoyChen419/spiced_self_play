@@ -158,11 +158,8 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                 logs.update(global_step=steps, valid_transitions=valid_steps,
                             replay_size=replay.size, updates=learner.updates,
                             SPS=steps / (time.monotonic() - start_time))
-                if epoch % args['eval']['eval_interval'] == 0 or finished:
-                    logs.update(evaluate(actor, args, logger, epoch))
-                logger.log(logs, steps)
-                print(f'FastTD3-LSTM step={steps} updates={learner.updates} SPS={logs["SPS"]:.0f}', flush=True)
-                if epoch % train_cfg['checkpoint_interval'] == 0 or finished:
+                evaluation_due = epoch % args['eval']['eval_interval'] == 0 or finished
+                if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due:
                     path = Path(train_cfg['data_dir']) / f'{env_name}_fasttd3_{logger.run_id}.pt'
                     path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(dict(algorithm='fasttd3', model_state_dict=actor.state_dict(),
@@ -170,6 +167,25 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                         actor_optimizer=learner.actor_opt.state_dict(), critic_optimizer=learner.critic_opt.state_dict(),
                         full_args=args, global_step=steps, updates=learner.updates), path)
                     checkpoint = str(path)
+                if evaluation_due:
+                    # Never retain old scores when the current evaluation fails.
+                    logs = {key: value for key, value in logs.items() if not key.startswith('eval/')}
+                    try:
+                        scores = evaluate(actor, args, logger, epoch)
+                        expected = []
+                        if args['eval']['human_replay_eval']:
+                            expected.append('eval/hr_score')
+                        if args['eval']['self_play_eval']:
+                            expected.append('eval/sp_score')
+                        if any(key not in scores for key in expected):
+                            raise RuntimeError('Evaluation returned no statistics for an enabled mode')
+                        logs.update(scores)
+                        logs['eval/failed'] = 0
+                    except Exception as error:
+                        logs['eval/failed'] = 1
+                        print(f'Evaluation failed: {error}. Checkpoint saved at {checkpoint}', flush=True)
+                logger.log(logs, steps)
+                print(f'FastTD3-LSTM step={steps} updates={learner.updates} SPS={logs["SPS"]:.0f}', flush=True)
         return [logs]
     finally:
         env.close()

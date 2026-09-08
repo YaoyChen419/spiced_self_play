@@ -154,6 +154,23 @@ class TestFastTD3(unittest.TestCase):
         with torch.no_grad():
             torch.testing.assert_close(restored.forward_eval(torch.from_numpy(obs), {})[0], action)
 
+    def test_replay_weights_remove_window_coverage_bias(self):
+        replay = EpisodeReplay(1, 4, 1, 1, 8, 42)
+        replay.episodes.append((np.arange(5, dtype=np.float32)[:, None],
+                                np.zeros((4, 1), np.float32),
+                                np.zeros(4, np.float32), np.zeros(4, bool)))
+        class EveryStart:
+            def integers(self, low, high, size):
+                return np.arange(high)
+        replay.rng = EveryStart()
+        for horizon in (1, 2, 4):
+            batch = replay.sample(4, horizon, 'cpu')
+            # Enumerate every possible start: each transition's total weight is one.
+            totals = torch.zeros(4)
+            positions = batch['obs'][:, :-1, 0][batch['mask']].long()
+            totals.scatter_add_(0, positions, batch['weights'][batch['mask']])
+            torch.testing.assert_close(totals, torch.ones(4))
+
     def test_native_training_and_reload(self):
         from pufferlib.pufferl import load_policy
         args = config()

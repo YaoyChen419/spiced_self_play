@@ -120,7 +120,7 @@ class EpisodeReplay:
 
     def sample(self, sequences, horizon, device):
         episodes = list(self.episodes)
-        # Uniform start transitions; padded suffixes do not contribute to losses.
+        # Uniform starts with inverse-coverage weights give uniform transition loss.
         lengths = np.asarray([len(e[1]) for e in episodes])
         ends = lengths.cumsum()
         draws = self.rng.integers(0, ends[-1], sequences)
@@ -133,6 +133,7 @@ class EpisodeReplay:
         rewards = np.zeros((sequences, horizon), np.float32)
         terminals = np.ones((sequences, horizon), bool)
         mask = np.zeros((sequences, horizon), bool)
+        weights = np.zeros((sequences, horizon), np.float32)
         for row, (idx, start) in enumerate(zip(selected, starts)):
             eo, ea, er, et = episodes[idx]
             n = min(horizon, len(ea) - start)
@@ -142,9 +143,10 @@ class EpisodeReplay:
             rewards[row, :n] = er[start:start + n]
             terminals[row, :n] = et[start:start + n]
             mask[row, :n] = True
+            weights[row, :n] = 1.0 / np.minimum(np.arange(start, start + n) + 1, horizon)
         return {key: torch.as_tensor(value, device=device) for key, value in
                 dict(obs=obs, prefix=prefix, lengths=starts, actions=actions,
-                     rewards=rewards, terminals=terminals, mask=mask).items()}
+                     rewards=rewards, terminals=terminals, mask=mask, weights=weights).items()}
 
 
 class Learner:
@@ -169,7 +171,8 @@ class Learner:
         horizon = train['rollout_horizon']
         sequences = train['minibatch_size'] // horizon
         micro = cfg['microbatch_sequences']
-        # Sample on CPU first so gradient accumulation has the exact valid denominator.
+        # Divide weighted losses by sampled starts, not the random sum of weights.
+        # Each transition then contributes equally in expectation across windows.
         batches = [replay.sample(min(micro, sequences - i), horizon, 'cpu')
                    for i in range(0, sequences, micro)]
         count = sum(int(b['mask'].sum()) for b in batches)
@@ -196,7 +199,9 @@ class Learner:
                     q1 = q2 = torch.where(take1[:, None], q1, q2)
             cf = self.features(self.critic.memory, b)[:, :-1][mask]
             logits1, logits2 = self.critic.head(cf, b['actions'][mask])
-            loss = -(q1 * F.log_softmax(logits1, -1) + q2 * F.log_softmax(logits2, -1)).sum() / count
+            per_transition = -(q1 * F.log_softmax(logits1, -1) +
+                               q2 * F.log_softmax(logits2, -1)).sum(-1)
+            loss = (per_transition * b['weights'][mask]).sum() / sequences
             loss.backward()
             critic_loss += loss.detach().item()
         nn.utils.clip_grad_norm_(self.critic.parameters(), train['max_grad_norm'])
@@ -216,7 +221,7 @@ class Learner:
                     v1 = self.critic.head.get_value(q1.softmax(-1))
                     v2 = self.critic.head.get_value(q2.softmax(-1))
                     value = torch.minimum(v1, v2) if cfg['use_cdq'] else (v1 + v2) / 2
-                    loss = -value.sum() / count
+                    loss = -(value * b['weights'][mask]).sum() / sequences
                     loss.backward()
                     actor_loss += loss.detach().item()
                 nn.utils.clip_grad_norm_(self.actor.parameters(), train['max_grad_norm'])
