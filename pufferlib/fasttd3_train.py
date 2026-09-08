@@ -8,7 +8,8 @@ import time
 import numpy as np
 import torch
 
-from pufferlib.fasttd3 import EpisodeReplay, Learner
+from pufferlib.fasttd3 import Learner
+from pufferlib.fasttd3_replay import DeviceEpisodeReplay
 
 
 def validate(args):
@@ -21,8 +22,10 @@ def validate(args):
         raise ValueError('This stage supports lambda=0 only; anchor regularization is not implemented')
     if not env['async_resets'] or env['episode_length'] <= 0:
         raise ValueError('FastTD3 training requires async_resets and a finite episode_length')
-    if train['precision'] != 'float32' or train['compile'] or int(os.environ.get('WORLD_SIZE', 1)) > 1:
-        raise ValueError('This recurrent adapter currently supports float32, compile=False and one learner process')
+    if int(os.environ.get('WORLD_SIZE', 1)) > 1:
+        raise ValueError('FastTD3 supports one learner process')
+    if cfg['amp_dtype'] not in ('bf16', 'fp16'):
+        raise ValueError('fasttd3.amp_dtype must be bf16 or fp16')
     if args.get('load_model_path') or args.get('load_id'):
         raise ValueError('Training resume is not implemented; use load-model-path for evaluation only')
     for key in ('replay_capacity', 'microbatch_sequences', 'policy_frequency', 'num_updates', 'learning_starts'):
@@ -88,6 +91,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.deterministic = train_cfg['torch_deterministic']
     args['env'].update(capture_final_observations=True, uses_memory=True,
                        memory_size=train_cfg['rollout_horizon'])
@@ -101,10 +105,10 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
         agents = env.num_agents
         obs_dim = env.single_observation_space.shape[0]
         act_dim = env.single_action_space.shape[0]
-        replay = EpisodeReplay(agents, args['env']['episode_length'], obs_dim, act_dim,
-                               cfg['replay_capacity'], seed)
-        previous_obs = np.empty((agents, obs_dim), np.float32)
-        previous_actions = np.empty((agents, act_dim), np.float32)
+        replay = DeviceEpisodeReplay(agents, args['env']['episode_length'], obs_dim, act_dim,
+                                     cfg['replay_capacity'], seed, device)
+        previous_obs = torch.empty((agents, obs_dim), device=device)
+        previous_actions = torch.empty((agents, act_dim), device=device)
         pending = np.zeros(agents, bool)
         dead = np.zeros(agents, bool)
         h = torch.zeros(agents, actor.hidden_size, device=device)
@@ -112,6 +116,8 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
         noise_scales = torch.empty(agents, 1, device=device).uniform_(cfg['std_min'], cfg['std_max'])
         steps = valid_steps = epoch = receives = 0
         start_time = time.monotonic()
+        speed_start = None
+        speed_steps = 0
         logs = {}
         env.async_reset(seed)
         while steps < train_cfg['total_timesteps']:
@@ -133,31 +139,38 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             h[reset_ids] = 0
             c[reset_ids] = 0
             noise_scales[reset_ids] = torch.empty(len(reset_ids), 1, device=device).uniform_(cfg['std_min'], cfg['std_max'])
-            with torch.no_grad():
+            with torch.no_grad(), learner.autocast():
+                device_obs = torch.as_tensor(obs, device=device)
+                if actor.obs_normalizer is not None:
+                    actor.obs_normalizer.update(device_obs)
                 state = dict(lstm_h=h[ids], lstm_c=c[ids])
-                action, _ = actor.forward_eval(torch.as_tensor(obs, device=device), state)
-                h[ids], c[ids] = state['lstm_h'], state['lstm_c']
-                action = (action + torch.randn_like(action) * noise_scales[ids]).clamp(-1, 1).cpu().numpy()
-            previous_obs[ids], previous_actions[ids] = obs, action
+                action, _ = actor.forward_eval(device_obs, state)
+                h[ids], c[ids] = state['lstm_h'].float(), state['lstm_c'].float()
+                device_action = (action + torch.randn_like(action) * noise_scales[ids]).clamp(-1, 1).float()
+                previous_obs[ids], previous_actions[ids] = device_obs, device_action
+                action = device_action.cpu().numpy()
             pending[ids] = True
             env.send(action)
             receives += 1
             if receives >= cfg['learning_starts'] and replay.size:
-                if train_cfg['anneal_lr']:
-                    fraction = max(0.0, 1 - steps / train_cfg['total_timesteps'])
-                    for opt, key in ((learner.actor_opt, 'actor_learning_rate'),
-                                     (learner.critic_opt, 'critic_learning_rate')):
-                        for group in opt.param_groups:
-                            group['lr'] = cfg[key] * fraction
+                learner.schedule(steps / train_cfg['total_timesteps'])
                 for _ in range(cfg['num_updates']):
                     logs = learner.update(replay)
+                if speed_start is None and learner.updates >= cfg['measure_burnin']:
+                    if torch.device(device).type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    speed_start, speed_steps = time.monotonic(), steps
             next_epoch = steps // train_cfg['batch_size']
             finished = steps >= train_cfg['total_timesteps']
             if next_epoch > epoch or finished:
                 epoch = next_epoch
                 logs.update(global_step=steps, valid_transitions=valid_steps,
                             replay_size=replay.size, updates=learner.updates,
+                            replay_bytes=replay.bytes,
                             SPS=steps / (time.monotonic() - start_time))
+                if speed_start is not None and steps > speed_steps:
+                    logs['SPS_train'] = (steps - speed_steps) / (time.monotonic() - speed_start)
+                overhead_start = time.monotonic()
                 evaluation_due = epoch % args['eval']['eval_interval'] == 0 or finished
                 if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due:
                     path = Path(train_cfg['data_dir']) / f'{env_name}_fasttd3_{logger.run_id}.pt'
@@ -165,6 +178,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                     torch.save(dict(algorithm='fasttd3', model_state_dict=actor.state_dict(),
                         critic_state_dict=learner.critic.state_dict(), target_state_dict=learner.target.state_dict(),
                         actor_optimizer=learner.actor_opt.state_dict(), critic_optimizer=learner.critic_opt.state_dict(),
+                        grad_scaler=learner.scaler.state_dict(),
                         full_args=args, global_step=steps, updates=learner.updates), path)
                     checkpoint = str(path)
                 if evaluation_due:
@@ -185,6 +199,8 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                         logs['eval/failed'] = 1
                         print(f'Evaluation failed: {error}. Checkpoint saved at {checkpoint}', flush=True)
                 logger.log(logs, steps)
+                if speed_start is not None:
+                    speed_start += time.monotonic() - overhead_start
                 print(f'FastTD3-LSTM step={steps} updates={learner.updates} SPS={logs["SPS"]:.0f}', flush=True)
         return [logs]
     finally:
