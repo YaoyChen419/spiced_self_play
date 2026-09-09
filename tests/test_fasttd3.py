@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 from pufferlib.fasttd3 import EpisodeReplay, Learner, RecurrentActor
 from pufferlib.fasttd3_replay import DeviceEpisodeReplay
-from pufferlib.fasttd3_train import train, transition_observations, validate
+from pufferlib.fasttd3_train import train, transition_observations, validate, TrainingStatistics
 from pufferlib.ocean.drive.drive import Drive, save_map_binary
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -245,6 +246,64 @@ class TestFastTD3(unittest.TestCase):
             policy = pufferl.load_policy(args, VectorView(), 'puffer_drive')
             with torch.no_grad():
                 self.assertTrue(torch.isfinite(policy.forward_eval(torch.from_numpy(env.observations), {})[0]).all())
+
+    def test_environment_statistics_and_delayed_actor_logs(self):
+        stats = TrainingStatistics()
+        stats.collect([{'episode_return': 2., 'nested': {'rate': [1., 3.]}},
+                       {'episode_return': 4., '_fasttd3_transition': {'observations': np.ones((8, 1125))}},
+                       {'array': np.array([2., 4.]), 'label': 'not numeric'}], 8, 6)
+        stats.learn(dict(critic_loss=4., actor_loss=0., actor_updated=0))
+        stats.learn(dict(critic_loss=2., actor_loss=-2., actor_updated=1))
+        metrics = stats.metrics()
+        self.assertEqual(metrics['environment/episode_return'], 3.)
+        self.assertEqual(metrics['environment/nested/rate'], 2.)
+        self.assertEqual(metrics['environment/array'], 3.)
+        self.assertEqual(metrics['losses/critic_loss'], 3.)
+        self.assertEqual(metrics['losses/actor_loss'], -2.)
+        self.assertEqual(metrics['replay/valid_transition_fraction'], .75)
+        self.assertFalse(any('transition/' in k or 'label' in k for k in metrics))
+
+    def test_wandb_metrics_evaluation_and_checkpoint_artifacts(self):
+        args = config()
+        args.update(wandb=True, wandb_project='test', wandb_group='test', tag=None)
+        args['env']['map_dir'] = self.maps.name
+        args['train']['checkpoint_interval'] = 2
+        args['train'].update(batch_size=32, total_timesteps=128)
+        args['eval'].update(eval_interval=2, human_replay_eval=True, self_play_eval=True)
+        artifacts = []
+        def artifact(name, type, metadata=None):
+            item = SimpleNamespace(name=name, type=type, metadata=metadata, files=[])
+            item.add_file = item.files.append
+            artifacts.append(item)
+            return item
+        sdk = SimpleNamespace(init=Mock(), log=Mock(), finish=Mock(), Artifact=artifact,
+            Histogram=lambda v: v.tolist(), run=SimpleNamespace(id='test-run', log_artifact=Mock()))
+        with tempfile.TemporaryDirectory() as output:
+            args['train']['data_dir'] = output
+            with patch.dict(sys.modules, {'wandb': sdk}), \
+                    patch('pufferlib.fasttd3_train.evaluate', return_value={
+                        'eval/hr_score': .5, 'eval/sp_score': .6}) as evaluation:
+                train('puffer_drive', args)
+            self.assertEqual([call.args[-1] for call in evaluation.call_args_list], [2, 4])
+            final = sdk.log.call_args.args[0]
+            self.assertEqual(sdk.log.call_args.kwargs['step'], 128)
+            for key in ('environment/episode_return', 'environment/collision_rate',
+                        'environment/offroad_rate', 'environment/route_progress',
+                        'losses/critic_loss', 'losses/actor_loss', 'performance/env',
+                        'performance/learn', 'agent_steps', 'epoch', 'uptime',
+                        'learning_rate', 'critic_learning_rate', 'data/lambda_distrib',
+                        'data/collision_reward_distrib', 'eval/hr_score', 'eval/sp_score'):
+                self.assertIn(key, final)
+            self.assertFalse(any('_fasttd3_transition' in k for k in final))
+            self.assertNotIn('losses/entropy', final)
+            checkpoints = [a for a in artifacts if a.type == 'checkpoint']
+            self.assertEqual([a.metadata['epoch'] for a in checkpoints], [2, 4])
+            for item in checkpoints:
+                self.assertEqual(len(item.files), 2)
+                self.assertTrue(all(Path(path).is_file() for path in item.files))
+            self.assertEqual(len(list(Path(output).glob('*/model_*.pt'))), 2)
+            self.assertEqual(artifacts[-1].type, 'model')
+            sdk.finish.assert_called_once()
 
     def test_native_evaluation_without_rendering(self):
         from pufferlib import pufferl
