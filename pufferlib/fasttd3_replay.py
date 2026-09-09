@@ -37,8 +37,8 @@ class DeviceEpisodeReplay:
         pos = self.lengths[ids]
         if np.any(pos >= self.horizon):
             raise RuntimeError('Episode exceeded configured length')
-        ix = torch.as_tensor(ids, device=self.device)
-        at = torch.as_tensor(pos, device=self.device)
+        ix = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+        at = torch.as_tensor(pos, dtype=torch.long, device=self.device)
         for storage, value in zip(self.live, (obs, actions, rewards, terminals)):
             storage[ix, at] = torch.as_tensor(value, dtype=storage.dtype, device=self.device)
         self.live[0][ix, at + 1] = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
@@ -47,12 +47,12 @@ class DeviceEpisodeReplay:
         n = len(finished)
         if n:
             slots = (self.cursor + np.arange(n)) % self.slots
-            dest = torch.as_tensor(slots, device=self.device)
-            source = torch.as_tensor(finished, device=self.device)
+            dest = torch.as_tensor(slots, dtype=torch.long, device=self.device)
+            source = torch.as_tensor(finished, dtype=torch.long, device=self.device)
             for saved, live in zip(self.saved, self.live):
                 saved[dest] = live[source]
             self.saved_lengths[slots] = self.lengths[finished]
-            self.device_lengths[dest] = torch.as_tensor(self.lengths[finished], device=self.device)
+            self.device_lengths[dest] = torch.as_tensor(self.lengths[finished], dtype=torch.long, device=self.device)
             self.ends = self.device_lengths.cumsum(0)
             self.lengths[finished] = 0
             self.cursor = (self.cursor + n) % self.slots
