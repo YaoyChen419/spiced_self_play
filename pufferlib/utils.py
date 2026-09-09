@@ -6,7 +6,7 @@ import subprocess
 import json
 
 
-def run_wosac_eval_in_subprocess(config, logger, global_step):
+def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
     """
     Run WOSAC evaluation in a subprocess and log metrics to wandb.
 
@@ -59,6 +59,19 @@ def run_wosac_eval_in_subprocess(config, logger, global_step):
         elif len(model_files) > 0:
             latest_cpt = max(model_files, key=os.path.getctime)
             cmd.extend(["--load-model-path", latest_cpt])
+
+        if full_args is not None:
+            # Preserve the trained policy architecture and Drive settings in
+            # the platform's existing evaluation subprocess.
+            cmd.extend(['--algorithm', full_args.get('algorithm', 'ppo'),
+                        '--train.device', full_args['train']['device']])
+            for section in ('env', 'policy', 'rnn', 'fasttd3', 'eval'):
+                for key, value in full_args.get(section, {}).items():
+                    if section == 'env' and key in ('capture_final_observations', 'uses_memory', 'memory_size', 'ini_file_path'):
+                        continue  # Runtime constructor arguments, not CLI options.
+                    if value is not None:
+                        cmd.extend([f'--{section}.{key.replace("_", "-")}', str(value)])
+            cmd.extend(['--eval.wosac-realism-eval', 'True'])
 
         # Run WOSAC evaluation in subprocess
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=os.getcwd())

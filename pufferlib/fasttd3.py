@@ -15,6 +15,13 @@ from pufferlib.models import LSTMWrapper
 from pufferlib.fasttd3_replay import DeviceEpisodeReplay as EpisodeReplay
 
 
+def float_logits(forward):
+    """Keep official C51 projection in FP32 without disabling AMP in its MLP."""
+    def wrapped(obs, actions):
+        return forward(obs, actions).float()
+    return wrapped
+
+
 class Memory(nn.Module):
     def __init__(self, env, args):
         super().__init__()
@@ -36,12 +43,12 @@ class Memory(nn.Module):
         h = obs.new_zeros(1, len(obs), self.hidden_size)
         c = torch.zeros_like(h)
         with torch.no_grad():
-            features = self.encoder.encode_observations(prefix.reshape(-1, prefix.shape[-1]))
-            features = features.reshape(len(prefix), prefix.shape[1], -1)
-            # Packed cuDNN requires CPU lengths. Zero-prefix rows get one dummy
-            # step whose state is discarded; encoder batch shapes stay fixed.
-            packed = pack_padded_sequence(features, lengths.clamp_min(1).cpu() if cpu_lengths is None else cpu_lengths,
+            # Pack before the expensive Drive encoder: padding must not consume
+            # road/partner embedding work. LayerNorm is per observation, so
+            # encoding packed observations preserves the original features.
+            packed = pack_padded_sequence(prefix, lengths.clamp_min(1).cpu() if cpu_lengths is None else cpu_lengths,
                                           batch_first=True, enforce_sorted=False)
+            packed = packed._replace(data=self.encoder.encode_observations(packed.data))
             _, (hp, cp) = self.lstm(packed)
             active = (lengths > 0)[None, :, None]
             h, c = torch.where(active, hp, h), torch.where(active, cp, c)
@@ -104,6 +111,8 @@ class Learner:
         self.actor = RecurrentActor(env, args).to(self.device)
         self.critic = RecurrentCritic(env, args).to(self.device)
         self.target = deepcopy(self.critic).requires_grad_(False)
+        for qnet in (self.target.head.qnet1, self.target.head.qnet2):
+            qnet.forward = float_logits(qnet.forward)
         self.amp_enabled = self.cfg['amp'] and torch.device(self.device).type == 'cuda'
         self.amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}[self.cfg['amp_dtype']]
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled and self.amp_dtype == torch.float16)
@@ -111,17 +120,42 @@ class Learner:
             lr=torch.tensor(self.cfg['actor_learning_rate'], device=self.device), weight_decay=self.cfg['weight_decay'])
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(),
             lr=torch.tensor(self.cfg['critic_learning_rate'], device=self.device), weight_decay=self.cfg['weight_decay'])
+        self.stable_grad_buffers = self.cfg['compile'] and self.cfg['compile_mode'] == 'reduce-overhead'
+        if self.stable_grad_buffers:
+            # Recurrent microbatches accumulate gradients. CUDA graphs require
+            # their destination buffers to exist outside graph capture.
+            for model in (self.actor, self.critic):
+                for parameter in model.parameters():
+                    parameter.grad = torch.zeros_like(parameter)
         if self.cfg['compile']:
             # cuDNN LSTM/packed sequences stay eager. Compile tensor-only regions
             # without wrapping modules, so checkpoint keys remain unchanged.
             for model in (self.actor, self.critic, self.target):
                 model.memory.encoder.encode_observations = torch.compile(
-                    model.memory.encoder.encode_observations, mode=self.cfg['compile_mode'])
+                    model.memory.encoder.encode_observations, mode=self.cfg['compile_mode'], dynamic=True)
             self.actor.head.forward = torch.compile(self.actor.head.forward, mode=self.cfg['compile_mode'])
             for model in (self.critic, self.target):
                 for qnet in (model.head.qnet1, model.head.qnet2):
                     qnet.forward = torch.compile(qnet.forward, mode=self.cfg['compile_mode'])
+            self.target.head.projection = torch.compile(self.target.head.projection, mode=self.cfg['compile_mode'])
+            self.critic_objective = torch.compile(self.critic_objective, mode=self.cfg['compile_mode'])
+            self.actor_objective = torch.compile(self.actor_objective, mode=self.cfg['compile_mode'])
         self.updates = 0
+
+    def critic_objective(self, features, actions, q1, q2, weights):
+        logits1, logits2 = self.critic.head(features, actions)
+        per_transition = -(q1 * F.log_softmax(logits1.float(), -1) +
+                           q2 * F.log_softmax(logits2.float(), -1)).sum(-1)
+        sequences = self.cfg['batch_size'] // self.args['train']['rollout_horizon']
+        return (per_transition * weights).sum() / sequences
+
+    def actor_objective(self, critic_features, actor_features, weights):
+        q1, q2 = self.critic.head(critic_features, self.actor.head(actor_features))
+        v1 = self.critic.head.get_value(q1.float().softmax(-1))
+        v2 = self.critic.head.get_value(q2.float().softmax(-1))
+        value = torch.minimum(v1, v2) if self.cfg['use_cdq'] else (v1 + v2) / 2
+        sequences = self.cfg['batch_size'] // self.args['train']['rollout_horizon']
+        return -(value * weights).sum() / sequences
 
     def autocast(self):
         return torch.autocast('cuda', dtype=self.amp_dtype) if self.amp_enabled else nullcontext()
@@ -147,7 +181,7 @@ class Learner:
     def update(self, replay):
         cfg, train = self.cfg, self.args['train']
         horizon = train['rollout_horizon']
-        sequences = train['minibatch_size'] // horizon
+        sequences = cfg['batch_size'] // horizon
         micro = cfg['microbatch_sequences']
         # Divide weighted losses by sampled starts, not the random sum of weights.
         # Each transition then contributes equally in expectation across windows.
@@ -156,8 +190,14 @@ class Learner:
                    for i in range(0, sequences, micro)]
         count = int(torch.stack([b['mask'].sum() for b in batches]).sum())
         batches = [{k: v.to(self.device) for k, v in b.items()} for b in batches]
+        # Packed cuDNN needs CPU lengths. Transfer once per optimizer update,
+        # rather than synchronizing the GPU separately for every microbatch.
+        cpu_lengths = torch.cat([b['lengths'] for b in batches]).clamp_min(1).cpu()
+        offset = 0
         for b in batches:
-            b['cpu_lengths'] = b['lengths'].clamp_min(1).cpu()
+            size = len(b['lengths'])
+            b['cpu_lengths'] = cpu_lengths[offset:offset + size]
+            offset += size
         if self.actor.obs_normalizer is not None:
             # Update statistics on real transitions only, never padded windows.
             # Freeze one shared statistics snapshot for all three networks.
@@ -170,7 +210,7 @@ class Learner:
                     b['prefix'] = self.actor.normalize(b['prefix'])
         self.updates += 1
         actor_step = self.updates % cfg['policy_frequency'] == 0
-        self.critic_opt.zero_grad(set_to_none=True)
+        self.critic_opt.zero_grad(set_to_none=not self.stable_grad_buffers)
         critic_loss = 0.0
         for b in batches:
             with torch.no_grad(), self.autocast():
@@ -181,27 +221,24 @@ class Learner:
                     -cfg['noise_clip'], cfg['noise_clip'])
                 next_actions = (next_actions + noise).clamp(-1, 1)
                 tf = self.features(self.target.memory, b)[:, 1:].reshape(-1, self.actor.hidden_size)
-                # C51's index_add requires float32 source and destination; keep
-                # projection out of autocast (the recurrent trunk still uses AMP).
-                with torch.autocast('cuda', enabled=False):
-                    q1, q2 = self.target.head.projection(tf.float(), next_actions.float(), b['rewards'].flatten(),
-                        (~b['terminals']).float().flatten(),
-                        torch.full_like(b['rewards'].flatten(), cfg['gamma']))
+                # Target logits are promoted before softmax/index_add; the
+                # target MLP itself still runs under the official AMP setting.
+                q1, q2 = self.target.head.projection(tf, next_actions, b['rewards'].flatten(),
+                    (~b['terminals']).float().flatten(),
+                    torch.full_like(b['rewards'].flatten(), cfg['gamma']))
                 if cfg['use_cdq']:
                     take1 = self.target.head.get_value(q1) < self.target.head.get_value(q2)
                     q1 = q2 = torch.where(take1[:, None], q1, q2)
             with self.autocast():
                 cf = self.features(self.critic.memory, b)[:, :-1].reshape(-1, self.actor.hidden_size)
-                logits1, logits2 = self.critic.head(cf, b['actions'].reshape(-1, b['actions'].shape[-1]))
-            per_transition = -(q1 * F.log_softmax(logits1.float(), -1) +
-                               q2 * F.log_softmax(logits2.float(), -1)).sum(-1)
-            loss = (per_transition * b['weights'].flatten()).sum() / sequences
+                loss = self.critic_objective(cf, b['actions'].reshape(-1, b['actions'].shape[-1]),
+                                            q1, q2, b['weights'].flatten())
             self.scaler.scale(loss).backward()
             critic_loss = critic_loss + loss.detach()
         self.optimizer_step(self.critic_opt, self.critic)
         actor_loss = 0.0
         if actor_step:
-            self.actor_opt.zero_grad(set_to_none=True)
+            self.actor_opt.zero_grad(set_to_none=not self.stable_grad_buffers)
             self.critic.requires_grad_(False)
             try:
                 for b in batches:
@@ -209,11 +246,7 @@ class Learner:
                         af = self.features(self.actor.memory, b)[:, :-1].reshape(-1, self.actor.hidden_size)
                         with torch.no_grad():
                             cf = self.features(self.critic.memory, b)[:, :-1].reshape(-1, self.actor.hidden_size)
-                        q1, q2 = self.critic.head(cf, self.actor.head(af))
-                    v1 = self.critic.head.get_value(q1.float().softmax(-1))
-                    v2 = self.critic.head.get_value(q2.float().softmax(-1))
-                    value = torch.minimum(v1, v2) if cfg['use_cdq'] else (v1 + v2) / 2
-                    loss = -(value * b['weights'].flatten()).sum() / sequences
+                        loss = self.actor_objective(cf, af, b['weights'].flatten())
                     self.scaler.scale(loss).backward()
                     actor_loss = actor_loss + loss.detach()
                 self.optimizer_step(self.actor_opt, self.actor)

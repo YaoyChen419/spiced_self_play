@@ -6,6 +6,8 @@ import os
 import random
 import time
 import shutil
+import signal
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -13,6 +15,35 @@ import torch
 from pufferlib.fasttd3 import Learner
 from pufferlib.fasttd3_replay import DeviceEpisodeReplay
 from pufferlib import unroll_nested_dict
+
+
+class VectorClock:
+    """Count full-vector-equivalent steps without synchronizing async workers."""
+    def __init__(self, agents):
+        self.agents = agents
+        self.slots = 0
+        self.steps = 0
+
+    def advance(self, slots):
+        self.slots += slots
+        current = self.slots // self.agents
+        due = range(self.steps, current)
+        self.steps = current
+        return due
+
+
+def print_dashboard(args, learner, utilization, profile, logs):
+    """Use the platform dashboard itself; only the learner's loss fields differ."""
+    from pufferlib.pufferl import PuffeRL
+    view = SimpleNamespace(config={**args['train'], 'env': args['env_name']},
+        utilization=utilization, profile=profile, sps=logs['SPS'],
+        global_step=logs['agent_steps'], epoch=logs['epoch'], uptime=logs['uptime'],
+        model_size=sum(p.numel() for model in (learner.actor, learner.critic)
+                       for p in model.parameters()),
+        losses={k.removeprefix('losses/'): v for k, v in logs.items() if k.startswith('losses/')},
+        stats={k.removeprefix('environment/'): v for k, v in logs.items() if k.startswith('environment/')},
+        last_stats={})
+    PuffeRL.print_dashboard(view)
 
 
 class TrainingStatistics:
@@ -97,13 +128,13 @@ def validate(args):
         raise ValueError('FastTD3 supports one learner process')
     if cfg['amp_dtype'] not in ('bf16', 'fp16'):
         raise ValueError('fasttd3.amp_dtype must be bf16 or fp16')
-    if args.get('load_model_path') or args.get('load_id'):
-        raise ValueError('Training resume is not implemented; use load-model-path for evaluation only')
+    if args.get('load_id'):
+        raise ValueError('Use load-model-path to continue a FastTD3 checkpoint')
     for key in ('replay_capacity', 'microbatch_sequences', 'policy_frequency', 'num_updates', 'learning_starts'):
         if cfg[key] <= 0:
             raise ValueError(f'fasttd3.{key} must be positive')
-    if train['minibatch_size'] < train['rollout_horizon'] or train['minibatch_size'] % train['rollout_horizon']:
-        raise ValueError('minibatch_size must be a positive multiple of rollout_horizon')
+    if cfg['batch_size'] < train['rollout_horizon'] or cfg['batch_size'] % train['rollout_horizon']:
+        raise ValueError('fasttd3.batch_size must be a positive multiple of rollout_horizon')
     if not 0 < cfg['tau'] <= 1 or cfg['num_atoms'] < 2 or cfg['v_min'] >= cfg['v_max']:
         raise ValueError('Invalid target update or distributional support parameters')
 
@@ -150,12 +181,10 @@ def evaluate(actor, args, logger, epoch):
 
 
 def train(env_name, args, vecenv=None, policy=None, logger=None):
-    from pufferlib.pufferl import load_env, NoLogger, WandbLogger, NeptuneLogger, Profile
+    from pufferlib.pufferl import load_env, NoLogger, WandbLogger, NeptuneLogger, Profile, Utilization
     validate(args)
     if policy is not None or vecenv is not None:
         raise ValueError('FastTD3 creates its own policy and an environment with final-observation capture')
-    if args['eval'].get('wosac_realism_eval'):
-        raise ValueError('WOSAC during FastTD3 training is not connected yet; use standalone evaluation')
     args = deepcopy(args)
     cfg, train_cfg = args['fasttd3'], args['train']
     seed = train_cfg['seed']
@@ -164,15 +193,38 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
     torch.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.deterministic = train_cfg['torch_deterministic']
+    torch.backends.cudnn.benchmark = True
     args['env'].update(capture_final_observations=True, uses_memory=True,
                        memory_size=train_cfg['rollout_horizon'])
     logger = logger or (WandbLogger(args) if args['wandb'] else
                         NeptuneLogger(args) if args['neptune'] else NoLogger(args))
     env = None
     checkpoint = None
+    utilization = None
+    stop_requested = False
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+    previous_sigint = signal.signal(signal.SIGINT, request_stop)
     try:
         env = load_env(env_name, args)
         learner = Learner(env.driver_env, args)
+        restored_steps = 0
+        if args.get('load_model_path'):
+            restored = torch.load(args['load_model_path'], map_location=train_cfg['device'], weights_only=False)
+            if restored.get('algorithm') != 'fasttd3':
+                raise ValueError('Expected a FastTD3 training checkpoint')
+            learner.actor.load_state_dict(restored['model_state_dict'])
+            learner.critic.load_state_dict(restored['critic_state_dict'])
+            learner.target.load_state_dict(restored['target_state_dict'])
+            learner.actor_opt.load_state_dict(restored['actor_optimizer'])
+            learner.critic_opt.load_state_dict(restored['critic_optimizer'])
+            learner.scaler.load_state_dict(restored['grad_scaler'])
+            learner.updates = restored['updates']
+            restored_steps = restored['global_step']
+            if restored_steps >= train_cfg['total_timesteps']:
+                raise ValueError('total_timesteps must exceed the checkpoint step')
+            print('Restored learner and optimizer state; environment and replay restart with fresh warmup.', flush=True)
         actor, device = learner.actor, train_cfg['device']
         agents = env.num_agents
         obs_dim = env.single_observation_space.shape[0]
@@ -186,7 +238,10 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
         h = torch.zeros(agents, actor.hidden_size, device=device)
         c = torch.zeros_like(h)
         noise_scales = torch.empty(agents, 1, device=device).uniform_(cfg['std_min'], cfg['std_max'])
-        steps = valid_steps = epoch = receives = 0
+        steps, valid_steps = restored_steps, 0
+        epoch = steps // train_cfg['batch_size']
+        vector_clock = VectorClock(agents)
+        utilization = Utilization()
         start_time = time.monotonic()
         speed_start = None
         speed_steps = 0
@@ -195,7 +250,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
         evaluation_stats = {}
         statistics = TrainingStatistics()
         profile = Profile()  # Original frequency=5 and CUDA synchronization semantics.
-        last_log_time, last_log_step = start_time, 0
+        last_log_time, last_log_step = start_time, steps
         env.async_reset(seed)
         while steps < train_cfg['total_timesteps']:
             profile('eval', epoch)
@@ -217,8 +272,8 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             if valid.any():
                 valid_ids = torch.as_tensor(ids[valid], dtype=torch.long, device=device)
                 replay.add(ids[valid], previous_obs[valid_ids], previous_actions[valid_ids],
-                           rewards[valid], next_obs[valid], true_terminals[valid], boundaries[valid])
-            steps += int(had_pending.sum())
+                           np.clip(rewards[valid], -1, 1), next_obs[valid], true_terminals[valid], boundaries[valid])
+            steps += int(np.asarray(masks, bool).sum())
             valid_steps += int(valid.sum())
             dead[ids] |= true_terminals
             dead[ids[truncations]] = False
@@ -241,8 +296,9 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             profile('env', epoch)
             env.send(action)
             profile.end()
-            receives += 1
-            if receives >= cfg['learning_starts'] and replay.size:
+            for vector_step in vector_clock.advance(int(had_pending.sum())):
+                if vector_step <= cfg['learning_starts'] or not replay.size:
+                    continue
                 profile('train', epoch)
                 profile('learn', epoch, nest=True)
                 learner.schedule(steps / train_cfg['total_timesteps'])
@@ -250,19 +306,20 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                     logs = learner.update(replay)
                     statistics.learn(logs)
                 profile.end()
-                if speed_start is None and learner.updates >= cfg['measure_burnin']:
+                if speed_start is None and vector_step >= cfg['learning_starts'] + cfg['measure_burnin']:
                     if torch.device(device).type == 'cuda':
                         torch.cuda.synchronize(device)
                     speed_start, speed_steps = time.monotonic(), steps
             next_epoch = steps // train_cfg['batch_size']
             finished = steps >= train_cfg['total_timesteps']
-            if next_epoch > epoch or finished:
+            if next_epoch > epoch or finished or stop_requested:
                 epoch = next_epoch
                 logs = {k: v for k, v in logs.items() if k in
                         ('critic_loss', 'actor_loss', 'actor_updated', 'valid_samples')}
                 logs.update(global_step=steps, valid_transitions=valid_steps,
                             replay_size=replay.size, updates=learner.updates,
                             replay_bytes=replay.bytes,
+                            vector_steps=vector_clock.steps,
                             agent_steps=steps, epoch=epoch,
                             uptime=time.monotonic() - start_time,
                             learning_rate=float(learner.actor_opt.param_groups[0]['lr']),
@@ -279,9 +336,14 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                 if speed_start is not None and steps > speed_steps:
                     logs['SPS_train'] = (steps - speed_steps) / (time.monotonic() - speed_start)
                 overhead_start = time.monotonic()
-                evaluation_due = epoch % args['eval']['eval_interval'] == 0 or finished
-                if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due:
+                evaluation_due = not stop_requested and (epoch % args['eval']['eval_interval'] == 0 or finished)
+                if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due or stop_requested:
                     checkpoint = save_checkpoint(learner, args, logger, steps, epoch)
+                    if args['eval'].get('wosac_realism_eval') and not stop_requested:
+                        from pufferlib.utils import run_wosac_eval_in_subprocess
+                        run_wosac_eval_in_subprocess(
+                            {**train_cfg, 'env': env_name, 'eval': args['eval']},
+                            logger, steps, full_args=args)
                 if evaluation_due:
                     # Never retain old scores when the current evaluation fails.
                     evaluation_stats = {}
@@ -301,7 +363,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                         print(f'Evaluation failed: {error}. Checkpoint saved at {checkpoint}', flush=True)
                 # Match PPO: check its 0.25 s throttle at an epoch boundary.
                 logs.update(evaluation_stats)
-                if finished or time.monotonic() > last_log_time + 0.25:
+                if finished or stop_requested or time.monotonic() > last_log_time + 0.25:
                     now = time.monotonic()
                     logs['SPS'] = (steps - last_log_step) / max(1e-9, now - last_log_time)
                     logs['uptime'] = now - start_time
@@ -309,17 +371,24 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                     evaluation_stats = {}
                     statistics = TrainingStatistics()
                     profile.clear()
+                    print_dashboard(args, learner, utilization, profile, logs)
                     last_log_time, last_log_step = time.monotonic(), steps
                 if speed_start is not None:
                     speed_start += time.monotonic() - overhead_start
-                print(f'FastTD3-LSTM step={steps} updates={learner.updates} SPS={logs["SPS"]:.0f}', flush=True)
+            if stop_requested:
+                break
         return [logs]
     finally:
+        if utilization is not None:
+            utilization.stop()
         try:
             if env is not None:
                 env.close()
         finally:
-            if checkpoint is not None:
-                logger.close(checkpoint)
-            elif isinstance(logger, WandbLogger):
-                logger.wandb.finish()
+            try:
+                if checkpoint is not None:
+                    logger.close(checkpoint)
+                elif isinstance(logger, WandbLogger):
+                    logger.wandb.finish()
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
