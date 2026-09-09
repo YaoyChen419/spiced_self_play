@@ -3,6 +3,7 @@ import ast
 import configparser
 import json
 import subprocess
+import signal
 import sys
 from pathlib import Path
 import tempfile
@@ -15,7 +16,7 @@ import torch
 
 from pufferlib.fasttd3 import EpisodeReplay, Learner, RecurrentActor
 from pufferlib.fasttd3_replay import DeviceEpisodeReplay
-from pufferlib.fasttd3_train import train, transition_observations, validate, TrainingStatistics
+from pufferlib.fasttd3_train import train, transition_observations, validate, TrainingStatistics, VectorClock
 from pufferlib.ocean.drive.drive import Drive, save_map_binary
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +45,7 @@ def config():
     args['rnn'].update(input_size=16, hidden_size=16)
     args['train'].update(device='cpu', use_rnn=True, rollout_horizon=2, minibatch_size=8,
                          batch_size=16, total_timesteps=64)
-    args['fasttd3'].update(actor_hidden_dim=16, critic_hidden_dim=32, num_atoms=11,
+    args['fasttd3'].update(batch_size=8, actor_hidden_dim=16, critic_hidden_dim=32, num_atoms=11,
                            v_min=-10., v_max=10., replay_capacity=64,
                            microbatch_sequences=2, learning_starts=1, num_updates=1, compile=False)
     args['vec'] = dict(backend='Serial', num_envs=1)
@@ -53,6 +54,91 @@ def config():
 
 
 class TestFastTD3(unittest.TestCase):
+    def test_vector_clock_is_independent_of_async_batch_size(self):
+        full, partial = VectorClock(8), VectorClock(8)
+        self.assertEqual(list(partial.advance(4)), [])
+        self.assertEqual(list(partial.advance(4)), list(full.advance(8)))
+        self.assertEqual(list(partial.advance(16)), list(full.advance(16)))
+        self.assertEqual(partial.steps, 3)
+
+    def test_continue_training_restores_learner_and_advances(self):
+        args = config()
+        args['env']['map_dir'] = self.maps.name
+        with tempfile.TemporaryDirectory() as output:
+            args['train']['data_dir'] = output
+            with patch('pufferlib.fasttd3_train.print_dashboard'):
+                train('puffer_drive', args)
+                checkpoint = next(Path(output).glob('*.pt'))
+                before = torch.load(checkpoint, weights_only=False)
+                args['load_model_path'] = str(checkpoint)
+                args['train']['total_timesteps'] = 128
+                logs = train('puffer_drive', args)
+            self.assertEqual(logs[-1]['agent_steps'], 128)
+            self.assertGreater(logs[-1]['updates'], before['updates'])
+
+    def test_wosac_subprocess_preserves_fasttd3_configuration(self):
+        from pufferlib.utils import run_wosac_eval_in_subprocess
+        from pufferlib.pufferl import load_config
+        args = config()
+        args['env'].update(capture_final_observations=True, uses_memory=True, memory_size=2)
+        with tempfile.TemporaryDirectory() as output:
+            directory = Path(output) / 'puffer_drive_test'
+            directory.mkdir()
+            checkpoint = directory / 'model_puffer_drive_000001.pt'
+            checkpoint.touch()
+            with patch('pufferlib.utils.subprocess.run', return_value=SimpleNamespace(
+                    returncode=0, stdout='', stderr='')) as process:
+                run_wosac_eval_in_subprocess({'data_dir': output, 'env': 'puffer_drive'},
+                    SimpleNamespace(run_id='test'), 32, full_args=args)
+            command = process.call_args.args[0]
+            with patch.object(sys, 'argv', ['test', *command[5:]]):
+                parsed = load_config('puffer_drive')
+            self.assertEqual(parsed['algorithm'], 'fasttd3')
+            self.assertEqual(parsed['env']['action_type'], 'continuous')
+            self.assertEqual(parsed['rnn']['hidden_size'], args['rnn']['hidden_size'])
+            self.assertEqual(parsed['fasttd3']['num_atoms'], args['fasttd3']['num_atoms'])
+            self.assertEqual(parsed['load_model_path'], str(checkpoint))
+
+    def test_sigint_saves_and_reward_clipping_is_preserved(self):
+        from pufferlib import pufferl
+        args = config()
+        args['env']['map_dir'] = self.maps.name
+        args['train']['total_timesteps'] = 10000
+        received_rewards = []
+        original_load, original_add, original_update = pufferl.load_env, DeviceEpisodeReplay.add, Learner.update
+        def load(*a, **kw):
+            env = original_load(*a, **kw)
+            recv = env.recv
+            def exaggerated_rewards():
+                o, r, d, t, info, ids, masks = recv()
+                rewards = np.full_like(r, 3.)
+                rewards[::2] = -3.
+                return o, rewards, d, t, info, ids, masks
+            env.recv = exaggerated_rewards
+            return env
+        def add(replay, ids, obs, actions, rewards, *rest):
+            received_rewards.extend(rewards.tolist())
+            return original_add(replay, ids, obs, actions, rewards, *rest)
+        def update(learner, replay):
+            result = original_update(learner, replay)
+            signal.raise_signal(signal.SIGINT)
+            return result
+        handler = signal.getsignal(signal.SIGINT)
+        with tempfile.TemporaryDirectory() as output:
+            args['train']['data_dir'] = output
+            with patch.object(pufferl, 'load_env', side_effect=load), \
+                    patch.object(DeviceEpisodeReplay, 'add', add), \
+                    patch.object(Learner, 'update', update), \
+                    patch('pufferlib.fasttd3_train.evaluate') as evaluation:
+                logs = train('puffer_drive', args)
+            saved = torch.load(next(Path(output).glob('*.pt')), weights_only=False)
+            self.assertEqual(saved['global_step'], logs[-1]['agent_steps'])
+            self.assertLess(saved['global_step'], 10000)
+            self.assertGreater(saved['updates'], 0)
+            self.assertEqual(set(received_rewards), {-1., 1.})
+            evaluation.assert_not_called()
+        self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
@@ -351,7 +437,7 @@ class TestFastTD3(unittest.TestCase):
                 '--env.map-dir', self.maps.name, '--env.num-maps', '1', '--env.num-agents', '8',
                 '--vec.backend', 'Serial', '--vec.num-envs', '1', '--vec.num-workers', '1', '--vec.batch-size', '1',
                 '--train.device', 'cuda', '--train.total-timesteps', '1024',
-                '--train.minibatch-size', '64', '--fasttd3.microbatch-sequences', '1',
+                '--fasttd3.batch-size', '64', '--fasttd3.microbatch-sequences', '1',
                 '--fasttd3.compile', 'False', '--fasttd3.replay-capacity', '2048',
                 '--train.data-dir', output, '--eval.human-replay-eval', 'False',
                 '--eval.self-play-eval', 'False']
