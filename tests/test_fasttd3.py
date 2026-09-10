@@ -44,7 +44,7 @@ def config():
     args['policy'].update(input_size=8, hidden_size=16)
     args['rnn'].update(input_size=16, hidden_size=16)
     args['train'].update(device='cpu', use_rnn=True, rollout_horizon=2, minibatch_size=8,
-                         batch_size=16, total_timesteps=64)
+                         batch_size=16, total_timesteps=64, final_rollouts=0)
     args['fasttd3'].update(batch_size=8, actor_hidden_dim=16, critic_hidden_dim=32, num_atoms=11,
                            v_min=-10., v_max=10., replay_capacity=64,
                            microbatch_sequences=2, learning_starts=1, num_updates=1, compile=False)
@@ -54,6 +54,61 @@ def config():
 
 
 class TestFastTD3(unittest.TestCase):
+    def test_final_collection_preserves_platform_rollouts_without_learning(self):
+        args = config()
+        args['env']['map_dir'] = self.maps.name
+        args['train']['final_rollouts'] = 2
+        with tempfile.TemporaryDirectory() as output:
+            args['train']['data_dir'] = output
+            with patch('pufferlib.fasttd3_train.print_dashboard'):
+                logs = train('puffer_drive', args)
+            self.assertEqual(len(logs), 2)
+            self.assertEqual(logs[-1]['phase'], 'final_collection')
+            self.assertEqual(logs[-1]['agent_steps'] - logs[0]['agent_steps'], 2 * args['train']['batch_size'])
+            self.assertEqual(logs[-1]['updates'], logs[0]['updates'])
+            self.assertEqual(logs[-1]['epoch'], logs[0]['epoch'])
+
+    def test_official_scalar_defaults_are_not_ppo_parameters(self):
+        import fast_td3.fast_td3 as official
+        source = Path(official.__file__).with_name('hyperparams.py')
+        base = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.ClassDef) and node.name == 'BaseArgs')
+        defaults = {}
+        for node in base.body:
+            if isinstance(node, ast.AnnAssign):
+                try:
+                    defaults[node.target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    pass
+        parser = configparser.ConfigParser()
+        parser.read(ROOT / 'pufferlib/config/ocean/drive.ini')
+        values = parser['fasttd3']
+        for key in ('batch_size', 'actor_learning_rate', 'critic_learning_rate',
+                    'actor_learning_rate_end', 'critic_learning_rate_end', 'gamma',
+                    'weight_decay', 'use_grad_norm_clipping', 'max_grad_norm',
+                    'amp', 'amp_dtype', 'obs_normalization', 'compile', 'compile_mode', 'measure_burnin', 'actor_hidden_dim',
+                    'critic_hidden_dim', 'init_scale', 'std_min', 'std_max', 'policy_noise',
+                    'noise_clip', 'policy_frequency', 'num_updates', 'learning_starts',
+                    'tau', 'num_atoms', 'v_min', 'v_max', 'use_cdq'):
+            raw = values[key]
+            try:
+                actual = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                actual = raw
+            self.assertEqual(actual, defaults[key], key)
+
+    def test_prefix_reconstruction_handles_zero_short_and_long_history(self):
+        env, args = self.make_env()
+        actor = RecurrentActor(env, args)
+        observation = torch.from_numpy(env.observations[:1])
+        prefix = observation[:, None].repeat(1, 110, 1)
+        window = observation[:, None].repeat(1, 3, 1)
+        with torch.no_grad():
+            for length in (0, 1, 7, 32, 59, 109):
+                expected = actor.memory(torch.cat((prefix[:, :length], window), dim=1))[0][:, length:]
+                actual = actor.memory.sequence(window, prefix, torch.tensor([length]))
+                torch.testing.assert_close(actual, expected)
+
     def test_vector_clock_is_independent_of_async_batch_size(self):
         full, partial = VectorClock(8), VectorClock(8)
         self.assertEqual(list(partial.advance(4)), [])
@@ -119,8 +174,8 @@ class TestFastTD3(unittest.TestCase):
         def add(replay, ids, obs, actions, rewards, *rest):
             received_rewards.extend(rewards.tolist())
             return original_add(replay, ids, obs, actions, rewards, *rest)
-        def update(learner, replay):
-            result = original_update(learner, replay)
+        def update(learner, replay, **kwargs):
+            result = original_update(learner, replay, **kwargs)
             signal.raise_signal(signal.SIGINT)
             return result
         handler = signal.getsignal(signal.SIGINT)
@@ -436,7 +491,7 @@ class TestFastTD3(unittest.TestCase):
                 '--algorithm', 'fasttd3', '--env.action-type', 'continuous',
                 '--env.map-dir', self.maps.name, '--env.num-maps', '1', '--env.num-agents', '8',
                 '--vec.backend', 'Serial', '--vec.num-envs', '1', '--vec.num-workers', '1', '--vec.batch-size', '1',
-                '--train.device', 'cuda', '--train.total-timesteps', '1024',
+                '--train.device', 'cuda', '--train.total-timesteps', '1024', '--train.final-rollouts', '0',
                 '--fasttd3.batch-size', '64', '--fasttd3.microbatch-sequences', '1',
                 '--fasttd3.compile', 'False', '--fasttd3.replay-capacity', '2048',
                 '--train.data-dir', output, '--eval.human-replay-eval', 'False',
@@ -453,16 +508,32 @@ class TestFastTD3(unittest.TestCase):
             self.assertTrue(saved['critic_optimizer']['state'])
 
     def test_multiprocessing_collector(self):
+        from pufferlib.pufferl import load_env
         args = config()
         args['env']['map_dir'] = self.maps.name
         args['vec'] = dict(backend='Multiprocessing', num_envs=2, num_workers=2,
                            batch_size=1, zero_copy=True, overwork=True)
         args['train']['total_timesteps'] = 96
+        workers = []
+        def tracked_env(*a, **kw):
+            env = load_env(*a, **kw)
+            workers.extend(env.processes)
+            return env
         with tempfile.TemporaryDirectory() as output:
             args['train']['data_dir'] = output
-            logs = train('puffer_drive', args)
+            with patch('pufferlib.pufferl.load_env', side_effect=tracked_env):
+                logs = train('puffer_drive', args)
             self.assertGreater(logs[-1]['updates'], 0)
             self.assertEqual(logs[-1]['global_step'], 96)
+            try:
+                for worker in workers:
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive(), 'env.close left a running worker')
+            finally:
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.kill()
+                    worker.join(timeout=5)
 
     def test_reject_nonzero_regularization(self):
         args = config()
