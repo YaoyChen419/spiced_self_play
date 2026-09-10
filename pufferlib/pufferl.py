@@ -1746,9 +1746,24 @@ def load_policy(args, vecenv, env_name=""):
         if args['env']['action_type'] != 'continuous':
             raise ValueError('FastTD3 evaluation requires --env.action-type continuous')
         policy = RecurrentActor(vecenv.driver_env, args).to(args['train']['device'])
-        if args.get('load_id'):
-            raise ValueError('Use --load-model-path for FastTD3 checkpoints')
         path = args.get('load_model_path')
+        if args.get('load_id'):
+            if path:
+                raise ValueError('Select either load-id or load-model-path')
+            if args['wandb']:
+                source_logger = WandbLogger(args, load_id=args['load_id'])
+                try:
+                    path = source_logger.download()
+                finally:
+                    source_logger.wandb.finish()
+            elif args['neptune']:
+                source_logger = NeptuneLogger(args, load_id=args['load_id'], mode='read-only')
+                try:
+                    path = source_logger.download()
+                finally:
+                    source_logger.neptune.stop()
+            else:
+                raise ValueError('load-id requires W&B or Neptune')
         if path:
             checkpoint = torch.load(path, map_location=args['train']['device'], weights_only=False)
             if checkpoint.get('algorithm') != 'fasttd3':

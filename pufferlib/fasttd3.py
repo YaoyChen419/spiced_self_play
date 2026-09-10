@@ -31,6 +31,7 @@ class Memory(nn.Module):
         self.hidden_size = args['rnn']['hidden_size']
         self.lstm = original.lstm
         self.lstm.batch_first = True
+        self.encode_prefix = self.encoder.encode_observations
 
     def forward(self, obs, state=None):
         batch, steps = obs.shape[:2]
@@ -48,7 +49,7 @@ class Memory(nn.Module):
             # encoding packed observations preserves the original features.
             packed = pack_padded_sequence(prefix, lengths.clamp_min(1).cpu() if cpu_lengths is None else cpu_lengths,
                                           batch_first=True, enforce_sorted=False)
-            packed = packed._replace(data=self.encoder.encode_observations(packed.data))
+            packed = packed._replace(data=self.encode_prefix(packed.data))
             _, (hp, cp) = self.lstm(packed)
             active = (lengths > 0)[None, :, None]
             h, c = torch.where(active, hp, h), torch.where(active, cp, c)
@@ -109,6 +110,8 @@ class Learner:
         self.args, self.cfg = args, args['fasttd3']
         self.device = args['train']['device']
         self.actor = RecurrentActor(env, args).to(self.device)
+        self.conditioning_indices = [env.lambda_obs_idx, env.reward_veh_obs_idx]
+        self.conditioning = None
         self.critic = RecurrentCritic(env, args).to(self.device)
         self.target = deepcopy(self.critic).requires_grad_(False)
         for qnet in (self.target.head.qnet1, self.target.head.qnet2):
@@ -131,8 +134,14 @@ class Learner:
             # cuDNN LSTM/packed sequences stay eager. Compile tensor-only regions
             # without wrapping modules, so checkpoint keys remain unchanged.
             for model in (self.actor, self.critic, self.target):
+                # Episode prefixes have varying numbers of valid observations.
+                # Compile their tensor work, but never record one CUDA graph
+                # for every prefix length. Fixed rollout/loss paths keep graphs.
+                model.memory.encode_prefix = torch.compile(
+                    model.memory.encode_prefix, dynamic=True,
+                    options={'triton.cudagraphs': False})
                 model.memory.encoder.encode_observations = torch.compile(
-                    model.memory.encoder.encode_observations, mode=self.cfg['compile_mode'], dynamic=True)
+                    model.memory.encoder.encode_observations, mode=self.cfg['compile_mode'], dynamic=False)
             self.actor.head.forward = torch.compile(self.actor.head.forward, mode=self.cfg['compile_mode'])
             for model in (self.critic, self.target):
                 for qnet in (model.head.qnet1, model.head.qnet2):
@@ -169,16 +178,21 @@ class Learner:
             opt.param_groups[0]['lr'].fill_(lr)
 
     def optimizer_step(self, optimizer, model):
+        self.scaler.unscale_(optimizer)
         if self.cfg['use_grad_norm_clipping']:
-            self.scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), self.cfg['max_grad_norm'])
+            norm = nn.utils.clip_grad_norm_(model.parameters(),
+                self.cfg['max_grad_norm'] if self.cfg['max_grad_norm'] > 0 else float('inf'))
+        else:
+            norm = torch.zeros((), device=self.device)
         self.scaler.step(optimizer)
+        self.scaler.update()
+        return norm
 
     @staticmethod
     def features(memory, batch):
         return memory.sequence(batch['obs'], batch['prefix'], batch['lengths'], batch['cpu_lengths'])
 
-    def update(self, replay):
+    def update(self, replay, actor_step=None):
         cfg, train = self.cfg, self.args['train']
         horizon = train['rollout_horizon']
         sequences = cfg['batch_size'] // horizon
@@ -190,6 +204,10 @@ class Learner:
                    for i in range(0, sequences, micro)]
         count = int(torch.stack([b['mask'].sum() for b in batches]).sum())
         batches = [{k: v.to(self.device) for k, v in b.items()} for b in batches]
+        # Match the platform's data/* meaning: raw observations actually used
+        # by the latest training batch, not a new collection snapshot.
+        self.conditioning = torch.cat([
+            b['obs'][:, :-1, self.conditioning_indices][b['mask']] for b in batches]).detach()
         # Packed cuDNN needs CPU lengths. Transfer once per optimizer update,
         # rather than synchronizing the GPU separately for every microbatch.
         cpu_lengths = torch.cat([b['lengths'] for b in batches]).clamp_min(1).cpu()
@@ -209,9 +227,12 @@ class Learner:
                     b['obs'] = self.actor.normalize(b['obs'])
                     b['prefix'] = self.actor.normalize(b['prefix'])
         self.updates += 1
-        actor_step = self.updates % cfg['policy_frequency'] == 0
+        if actor_step is None:
+            actor_step = self.updates % cfg['policy_frequency'] == 0
         self.critic_opt.zero_grad(set_to_none=not self.stable_grad_buffers)
         critic_loss = 0.0
+        qf_min = torch.full((), float('inf'), device=self.device)
+        qf_max = -qf_min
         for b in batches:
             with torch.no_grad(), self.autocast():
                 # FastTD3 uses the current actor and a target critic (no target actor).
@@ -226,6 +247,10 @@ class Learner:
                 q1, q2 = self.target.head.projection(tf, next_actions, b['rewards'].flatten(),
                     (~b['terminals']).float().flatten(),
                     torch.full_like(b['rewards'].flatten(), cfg['gamma']))
+                values = self.target.head.get_value(q1)
+                valid = b['mask'].flatten()
+                qf_min = torch.minimum(qf_min, values.masked_fill(~valid, float('inf')).min())
+                qf_max = torch.maximum(qf_max, values.masked_fill(~valid, -float('inf')).max())
                 if cfg['use_cdq']:
                     take1 = self.target.head.get_value(q1) < self.target.head.get_value(q2)
                     q1 = q2 = torch.where(take1[:, None], q1, q2)
@@ -235,8 +260,9 @@ class Learner:
                                             q1, q2, b['weights'].flatten())
             self.scaler.scale(loss).backward()
             critic_loss = critic_loss + loss.detach()
-        self.optimizer_step(self.critic_opt, self.critic)
+        critic_grad_norm = self.optimizer_step(self.critic_opt, self.critic)
         actor_loss = 0.0
+        actor_grad_norm = torch.zeros((), device=self.device)
         if actor_step:
             self.actor_opt.zero_grad(set_to_none=not self.stable_grad_buffers)
             self.critic.requires_grad_(False)
@@ -249,12 +275,15 @@ class Learner:
                         loss = self.actor_objective(cf, af, b['weights'].flatten())
                     self.scaler.scale(loss).backward()
                     actor_loss = actor_loss + loss.detach()
-                self.optimizer_step(self.actor_opt, self.actor)
+                actor_grad_norm = self.optimizer_step(self.actor_opt, self.actor)
             finally:
                 self.critic.requires_grad_(True)
-        self.scaler.update()
         with torch.no_grad():
             torch._foreach_mul_(list(self.target.parameters()), 1 - cfg['tau'])
             torch._foreach_add_(list(self.target.parameters()), list(self.critic.parameters()), alpha=cfg['tau'])
+        buffer_reward = sum((b['rewards'] * b['mask']).sum() for b in batches) / max(count, 1)
         return dict(critic_loss=float(critic_loss), actor_loss=float(actor_loss),
-                    actor_updated=int(actor_step), valid_samples=count)
+                    qf_loss=float(critic_loss), qf_min=float(qf_min), qf_max=float(qf_max),
+                    critic_grad_norm=float(critic_grad_norm), actor_grad_norm=float(actor_grad_norm),
+                    buffer_rewards=float(buffer_reward),
+                    actor_updated=int(actor_step), valid_samples=count, sampled_slots=cfg['batch_size'])

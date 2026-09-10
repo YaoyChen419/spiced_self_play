@@ -52,10 +52,15 @@ class TrainingStatistics:
         self.environment = defaultdict(list)
         self.losses = defaultdict(list)
         self.raw_steps = self.valid_steps = 0
+        self.sampled_valid = self.sampled_slots = 0
+        self.reward_sum = self.reward_count = 0
 
-    def collect(self, infos, raw_steps, valid_steps):
+    def collect(self, infos, raw_steps, valid_steps, rewards=None):
         self.raw_steps += raw_steps
         self.valid_steps += valid_steps
+        if rewards is not None:
+            self.reward_sum += float(np.sum(rewards))
+            self.reward_count += len(rewards)
         for info in infos:
             # Pre-reset observations are replay data, not environment metrics.
             public = {k: v for k, v in info.items() if k != '_fasttd3_transition'}
@@ -65,24 +70,35 @@ class TrainingStatistics:
                     self.environment[key].extend(values.reshape(-1).tolist())
 
     def learn(self, result):
+        self.sampled_valid += result.get('valid_samples', 0)
+        self.sampled_slots += result.get('sampled_slots', 0)
         self.losses['critic_loss'].append(result['critic_loss'])
+        for key in ('qf_loss', 'qf_min', 'qf_max', 'critic_grad_norm', 'buffer_rewards'):
+            if key in result:
+                self.losses[key].append(result[key])
         if result['actor_updated']:
             # A delayed actor step is absent, not an observed zero actor loss.
             self.losses['actor_loss'].append(result['actor_loss'])
+            if 'actor_grad_norm' in result:
+                self.losses['actor_grad_norm'].append(result['actor_grad_norm'])
 
     def metrics(self):
-        return {
+        metrics = {
             **{f'environment/{k}': float(np.mean(v)) for k, v in self.environment.items()},
             **{f'losses/{k}': float(np.mean(v)) for k, v in self.losses.items()},
             # Replay reuses transitions; report admission separately instead of
             # mislabelling it as PPO's on-policy perc_transitions_used.
             'replay/valid_transition_fraction': self.valid_steps / max(1, self.raw_steps),
         }
+        if self.sampled_slots:
+            metrics['environment/perc_transitions_used'] = self.sampled_valid / self.sampled_slots
+        if self.reward_count:
+            metrics['env_rewards'] = self.reward_sum / self.reward_count
+        return metrics
 
 
-def save_checkpoint(learner, args, logger, steps, epoch):
+def save_checkpoint(learner, args, logger, steps, epoch, publish=True):
     """Keep numbered models, trainer state and W&B checkpoint artifacts."""
-    from pufferlib.pufferl import WandbLogger
     env_name = args['env_name']
     directory = Path(args['train']['data_dir']) / f'{env_name}_{logger.run_id}'
     directory.mkdir(parents=True, exist_ok=True)
@@ -91,7 +107,7 @@ def save_checkpoint(learner, args, logger, steps, epoch):
         critic_state_dict=learner.critic.state_dict(), target_state_dict=learner.target.state_dict(),
         actor_optimizer=learner.actor_opt.state_dict(), critic_optimizer=learner.critic_opt.state_dict(),
         grad_scaler=learner.scaler.state_dict(), full_args=args, global_step=steps,
-        updates=learner.updates)
+        updates=learner.updates, epoch=epoch)
     temporary = model_path.with_suffix('.pt.tmp')
     torch.save(payload, temporary)
     os.replace(temporary, model_path)
@@ -101,17 +117,27 @@ def save_checkpoint(learner, args, logger, steps, epoch):
         actor_optimizer=learner.actor_opt.state_dict(), critic_optimizer=learner.critic_opt.state_dict(),
         grad_scaler=learner.scaler.state_dict()), str(state_path) + '.tmp')
     os.replace(str(state_path) + '.tmp', state_path)
-    # Retain the adapter's existing latest-model path for evaluation commands.
-    latest = directory.parent / f'{env_name}_fasttd3_{logger.run_id}.pt'
+    # Match the platform's final-model path as well as its numbered directory.
+    latest = directory.parent / f'{env_name}_{logger.run_id}.pt'
     shutil.copyfile(model_path, str(latest) + '.tmp')
     os.replace(str(latest) + '.tmp', latest)
+    print(f'Checkpoint saved: step={steps} updates={learner.updates} path={latest}', flush=True)
+    if publish:
+        publish_checkpoint(args, logger, steps, epoch)
+    return str(latest)
+
+
+def publish_checkpoint(args, logger, steps, epoch):
+    from pufferlib.pufferl import WandbLogger
     if isinstance(logger, WandbLogger):
+        directory = Path(args['train']['data_dir']) / f"{args['env_name']}_{logger.run_id}"
+        model_path = directory / f"model_{args['env_name']}_{epoch:06d}.pt"
+        state_path = directory / 'trainer_state.pt'
         artifact = logger.wandb.Artifact(f'checkpoint-{logger.run_id}-epoch{epoch:06d}',
             type='checkpoint', metadata={'epoch': epoch, 'global_step': steps})
         artifact.add_file(str(model_path))
         artifact.add_file(str(state_path))
         logger.wandb.run.log_artifact(artifact)
-    return str(latest)
 
 
 def validate(args):
@@ -128,11 +154,15 @@ def validate(args):
         raise ValueError('FastTD3 supports one learner process')
     if cfg['amp_dtype'] not in ('bf16', 'fp16'):
         raise ValueError('fasttd3.amp_dtype must be bf16 or fp16')
-    if args.get('load_id'):
-        raise ValueError('Use load-model-path to continue a FastTD3 checkpoint')
-    for key in ('replay_capacity', 'microbatch_sequences', 'policy_frequency', 'num_updates', 'learning_starts'):
+    if args.get('load_id') and args.get('load_model_path'):
+        raise ValueError('Select either load-id or load-model-path')
+    if train['final_rollouts'] < 0:
+        raise ValueError('final_rollouts must be non-negative')
+    for key in ('replay_capacity', 'microbatch_sequences', 'policy_frequency', 'num_updates'):
         if cfg[key] <= 0:
             raise ValueError(f'fasttd3.{key} must be positive')
+    if cfg['learning_starts'] < 0 or cfg['measure_burnin'] < 0:
+        raise ValueError('learning_starts and measure_burnin must be non-negative')
     if cfg['batch_size'] < train['rollout_horizon'] or cfg['batch_size'] % train['rollout_horizon']:
         raise ValueError('fasttd3.batch_size must be a positive multiple of rollout_horizon')
     if not 0 < cfg['tau'] <= 1 or cfg['num_atoms'] < 2 or cfg['v_min'] >= cfg['v_max']:
@@ -171,8 +201,10 @@ def evaluate(actor, args, logger, epoch):
             try:
                 evaluator.rollout(actor, mode=mode)
             finally:
-                env.driver_env.stop_recorder(0)
-                env.close()
+                try:
+                    env.driver_env.stop_recorder(0)
+                finally:
+                    env.close()
             evaluator.log_videos(eval_mode=mode, epoch=epoch)
         return evaluator.collect_stats() if (args['eval']['human_replay_eval'] or
                                              args['eval']['self_play_eval']) else {}
@@ -196,20 +228,29 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
     torch.backends.cudnn.benchmark = True
     args['env'].update(capture_final_observations=True, uses_memory=True,
                        memory_size=train_cfg['rollout_horizon'])
-    logger = logger or (WandbLogger(args) if args['wandb'] else
-                        NeptuneLogger(args) if args['neptune'] else NoLogger(args))
+    logger = logger or (WandbLogger(args, load_id=args.get('load_id')) if args['wandb'] else
+                        NeptuneLogger(args, load_id=args.get('load_id')) if args['neptune'] else NoLogger(args))
     env = None
     checkpoint = None
     utilization = None
     stop_requested = False
+    learner_pid = os.getpid()
     def request_stop(signum, frame):
         nonlocal stop_requested
+        # Forked environment workers must exit when env.close() terminates
+        # them; only the learner can perform checkpoint/log finalization.
+        if os.getpid() != learner_pid:
+            raise SystemExit(128 + signum)
         stop_requested = True
-    previous_sigint = signal.signal(signal.SIGINT, request_stop)
+    previous_handlers = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        if args.get('load_id'):
+            if not hasattr(logger, 'download'):
+                raise ValueError('load-id requires the original W&B or Neptune logger')
+            args['load_model_path'] = logger.download()
         env = load_env(env_name, args)
         learner = Learner(env.driver_env, args)
-        restored_steps = 0
+        restored_steps = restored_epoch = 0
         if args.get('load_model_path'):
             restored = torch.load(args['load_model_path'], map_location=train_cfg['device'], weights_only=False)
             if restored.get('algorithm') != 'fasttd3':
@@ -222,6 +263,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             learner.scaler.load_state_dict(restored['grad_scaler'])
             learner.updates = restored['updates']
             restored_steps = restored['global_step']
+            restored_epoch = restored.get('epoch', restored_steps // train_cfg['batch_size'])
             if restored_steps >= train_cfg['total_timesteps']:
                 raise ValueError('total_timesteps must exceed the checkpoint step')
             print('Restored learner and optimizer state; environment and replay restart with fresh warmup.', flush=True)
@@ -239,20 +281,29 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
         c = torch.zeros_like(h)
         noise_scales = torch.empty(agents, 1, device=device).uniform_(cfg['std_min'], cfg['std_max'])
         steps, valid_steps = restored_steps, 0
-        epoch = steps // train_cfg['batch_size']
+        epoch = restored_epoch
+        initial_epoch = epoch
+        rollout_slots = 0
+        drain_until = None
+        pending_checkpoint = None
+        all_logs = []
         vector_clock = VectorClock(agents)
         utilization = Utilization()
         start_time = time.monotonic()
         speed_start = None
         speed_steps = 0
-        conditioning = None
         logs = {}
         evaluation_stats = {}
         statistics = TrainingStatistics()
         profile = Profile()  # Original frequency=5 and CUDA synchronization semantics.
         last_log_time, last_log_step = start_time, steps
         env.async_reset(seed)
-        while steps < train_cfg['total_timesteps']:
+        while True:
+            if (speed_start is None and replay.size and
+                    vector_clock.steps >= cfg['learning_starts'] + cfg['measure_burnin']):
+                if torch.device(device).type == 'cuda':
+                    torch.cuda.synchronize(device)
+                speed_start, speed_steps = time.monotonic(), steps
             profile('eval', epoch)
             profile('env', epoch, nest=True)
             obs, rewards, terminals, truncations, infos, ids, masks = env.recv()
@@ -263,17 +314,14 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             had_pending = pending[ids].copy()
             next_obs, true_terminals = transition_observations(obs, terminals, infos, had_pending.any())
             valid = had_pending & ~dead[ids] & np.asarray(masks, bool)
-            statistics.collect(infos, int(had_pending.sum()), int(valid.sum()))
-            live = ~dead[ids] & np.asarray(masks, bool)
-            if live.any():
-                conditioning = obs[live][:, [env.driver_env.lambda_obs_idx,
-                                              env.driver_env.reward_veh_obs_idx]].copy()
+            statistics.collect(infos, int(had_pending.sum()), int(valid.sum()), np.clip(rewards[valid], -1, 1))
             boundaries = terminals | truncations
             if valid.any():
                 valid_ids = torch.as_tensor(ids[valid], dtype=torch.long, device=device)
                 replay.add(ids[valid], previous_obs[valid_ids], previous_actions[valid_ids],
                            np.clip(rewards[valid], -1, 1), next_obs[valid], true_terminals[valid], boundaries[valid])
             steps += int(np.asarray(masks, bool).sum())
+            rollout_slots += len(ids)
             valid_steps += int(valid.sum())
             dead[ids] |= true_terminals
             dead[ids[truncations]] = False
@@ -284,7 +332,7 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             profile('eval_forward', epoch)
             with torch.no_grad(), learner.autocast():
                 device_obs = torch.as_tensor(obs, device=device)
-                if actor.obs_normalizer is not None:
+                if actor.obs_normalizer is not None and drain_until is None:
                     actor.obs_normalizer.update(device_obs)
                 state = dict(lstm_h=h[device_ids], lstm_c=c[device_ids])
                 action, _ = actor.forward_eval(device_obs, state)
@@ -297,37 +345,42 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
             env.send(action)
             profile.end()
             for vector_step in vector_clock.advance(int(had_pending.sum())):
-                if vector_step <= cfg['learning_starts'] or not replay.size:
+                if drain_until is not None or vector_step <= cfg['learning_starts'] or not replay.size:
                     continue
                 profile('train', epoch)
                 profile('learn', epoch, nest=True)
                 learner.schedule(steps / train_cfg['total_timesteps'])
-                for _ in range(cfg['num_updates']):
-                    logs = learner.update(replay)
+                for update_index in range(cfg['num_updates']):
+                    # Match the official schedule, including num_updates=1.
+                    actor_due = (update_index % cfg['policy_frequency'] == 1
+                                 if cfg['num_updates'] > 1 else vector_step % cfg['policy_frequency'] == 0)
+                    logs = learner.update(replay, actor_step=actor_due)
                     statistics.learn(logs)
                 profile.end()
-                if speed_start is None and vector_step >= cfg['learning_starts'] + cfg['measure_burnin']:
-                    if torch.device(device).type == 'cuda':
-                        torch.cuda.synchronize(device)
-                    speed_start, speed_steps = time.monotonic(), steps
-            next_epoch = steps // train_cfg['batch_size']
-            finished = steps >= train_cfg['total_timesteps']
-            if next_epoch > epoch or finished or stop_requested:
-                epoch = next_epoch
+            next_epoch = initial_epoch + rollout_slots // train_cfg['batch_size']
+            finished = drain_until is None and steps >= train_cfg['total_timesteps']
+            drain_finished = (drain_until is not None and rollout_slots >= drain_until
+                              and bool(statistics.environment))
+            if (drain_until is None and next_epoch > epoch) or finished or drain_finished or stop_requested:
+                if drain_until is None:
+                    epoch = next_epoch
                 logs = {k: v for k, v in logs.items() if k in
-                        ('critic_loss', 'actor_loss', 'actor_updated', 'valid_samples')}
+                        ('critic_loss', 'actor_loss', 'actor_updated', 'valid_samples',
+                         'qf_loss', 'qf_min', 'qf_max', 'actor_grad_norm', 'critic_grad_norm', 'buffer_rewards')}
                 logs.update(global_step=steps, valid_transitions=valid_steps,
                             replay_size=replay.size, updates=learner.updates,
                             replay_bytes=replay.bytes,
                             vector_steps=vector_clock.steps,
                             agent_steps=steps, epoch=epoch,
+                            phase='final_collection' if drain_until is not None else 'train',
                             uptime=time.monotonic() - start_time,
                             learning_rate=float(learner.actor_opt.param_groups[0]['lr']),
                             critic_learning_rate=float(learner.critic_opt.param_groups[0]['lr']),
                             SPS=(steps - last_log_step) / max(1e-9, time.monotonic() - last_log_time),
                             **statistics.metrics(),
                             **{f'performance/{k}': v['elapsed'] for k, v in profile})
-                if conditioning is not None:
+                if learner.conditioning is not None:
+                    conditioning = learner.conditioning.cpu().numpy()
                     logs['data/lambda_mean'] = float(conditioning[:, 0].mean())
                     logs['data/lambda_std'] = float(conditioning[:, 0].std())
                     if isinstance(logger, WandbLogger):
@@ -336,10 +389,12 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                 if speed_start is not None and steps > speed_steps:
                     logs['SPS_train'] = (steps - speed_steps) / (time.monotonic() - speed_start)
                 overhead_start = time.monotonic()
-                evaluation_due = not stop_requested and (epoch % args['eval']['eval_interval'] == 0 or finished)
-                if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due or stop_requested:
-                    checkpoint = save_checkpoint(learner, args, logger, steps, epoch)
-                    if args['eval'].get('wosac_realism_eval') and not stop_requested:
+                evaluation_due = (drain_until is None and not stop_requested
+                                  and (epoch % args['eval']['eval_interval'] == 0 or finished))
+                if epoch % train_cfg['checkpoint_interval'] == 0 or finished or evaluation_due or stop_requested or drain_finished:
+                    checkpoint = save_checkpoint(learner, args, logger, steps, epoch, publish=False)
+                    pending_checkpoint = (steps, epoch)
+                    if args['eval'].get('wosac_realism_eval') and not stop_requested and drain_until is None:
                         from pufferlib.utils import run_wosac_eval_in_subprocess
                         run_wosac_eval_in_subprocess(
                             {**train_cfg, 'env': env_name, 'eval': args['eval']},
@@ -363,21 +418,37 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                         print(f'Evaluation failed: {error}. Checkpoint saved at {checkpoint}', flush=True)
                 # Match PPO: check its 0.25 s throttle at an epoch boundary.
                 logs.update(evaluation_stats)
-                if finished or stop_requested or time.monotonic() > last_log_time + 0.25:
+                if finished or drain_finished or stop_requested or time.monotonic() > last_log_time + 0.25:
                     now = time.monotonic()
                     logs['SPS'] = (steps - last_log_step) / max(1e-9, now - last_log_time)
                     logs['uptime'] = now - start_time
-                    logger.log(logs, steps)
-                    evaluation_stats = {}
-                    statistics = TrainingStatistics()
                     profile.clear()
                     print_dashboard(args, learner, utilization, profile, logs)
+                    print(f'FastTD3 step={steps} updates={learner.updates} SPS={logs["SPS"]:.1f}', flush=True)
+                    logger.log(logs, steps)
+                    if steps > .20 * train_cfg['total_timesteps']:
+                        if drain_finished:
+                            all_logs.append(logs.copy())
+                        else:
+                            all_logs = [logs.copy()]
+                    evaluation_stats = {}
+                    statistics = TrainingStatistics()
                     last_log_time, last_log_step = time.monotonic(), steps
+                if pending_checkpoint is not None:
+                    publish_checkpoint(args, logger, *pending_checkpoint)
+                    pending_checkpoint = None
                 if speed_start is not None:
                     speed_start += time.monotonic() - overhead_start
-            if stop_requested:
+            if stop_requested or drain_finished:
                 break
-        return [logs]
+            if finished:
+                final_rollouts = train_cfg['final_rollouts']
+                if final_rollouts == 0:
+                    break
+                drain_until = rollout_slots + final_rollouts * train_cfg['batch_size']
+                print(f'Final collection: {final_rollouts} rollouts, no optimizer updates.', flush=True)
+        print(f'Training stopped: reason={"signal" if stop_requested else "budget"} step={steps} checkpoint={checkpoint}', flush=True)
+        return all_logs or [logs]
     finally:
         if utilization is not None:
             utilization.stop()
@@ -390,5 +461,8 @@ def train(env_name, args, vecenv=None, policy=None, logger=None):
                     logger.close(checkpoint)
                 elif isinstance(logger, WandbLogger):
                     logger.wandb.finish()
+                elif isinstance(logger, NeptuneLogger):
+                    logger.neptune.stop()
             finally:
-                signal.signal(signal.SIGINT, previous_sigint)
+                for sig, handler in previous_handlers.items():
+                    signal.signal(sig, handler)
