@@ -1,8 +1,8 @@
 # FastTD3-LSTM 迁移说明
 
-当前仍在完成工程一致性修复，不能据此宣布完整迁移或速度验收通过。2026-09-09 用户明确批准保留当前 episode 记忆边界，作为相对原 PPO rollout 清零规则的实验差异；奖励裁剪必须保留。
+2026-09-10 本轮工程修复已落实；不能据此宣布收敛、速度或所有功能完全等价。逐项源码对照和不能直接移植的内容见 `FASTTD3_PARITY_AUDIT.md` 顶部。2026-09-09 用户明确批准保留 episode 记忆边界，作为相对原 PPO rollout 清零规则的实验差异；奖励裁剪必须保留。
 
-实现是面向驾驶环境的 **FastTD3-LSTM 适配版**。复用官方 FastTD3 的 actor、双分布式 critic 和 C51 投影，依赖固定到提交 `229ed59bbf43ea2f7a2d5d90d1076314839944d7`。保留原作 Drive 编码器及 LSTM 的结构和初始化；actor、critic 各有独立的编码器/LSTM，目标 critic 包含对应的记忆网络。LSTM 的输入仍是观测编码，没有额外加入前一动作。
+实现是面向驾驶环境的 **FastTD3-LSTM 适配版**。复用官方 FastTD3 的 actor、双分布型 critic 和 C51 投影，依赖固定到提交 `229ed59bbf43ea2f7a2d5d90d1076314839944d7`。保留原作 Drive 编码器及 LSTM 的结构和初始化；actor、critic 各有独立的编码器/LSTM，目标 critic 包含对应的记忆网络。LSTM 的输入仍是观测编码，没有额外加入前一动作。
 
 ## 保留与必要变化
 
@@ -11,7 +11,7 @@
 - PPO 的 GAE、裁剪目标、熵奖励和 value loss 被回放学习、分布式 Q 目标及确定性策略梯度替代。PPO 专属优化参数不再适用。
 - FastTD3 使用当前 actor 计算下一动作，不另建 target actor；每次 critic 更新都软更新 target critic，每两次 critic 更新更新一次 actor。
 - `[fasttd3]` 单独记录算法参数：actor/critic 学习率均为 3e-4、head 宽度 512/1024、101 atoms、支持区间 [-250, 250]、tau=0.1、探索标准差 [0.001, 0.4]、目标噪声 0.001、噪声裁剪 0.5、CDQ 开启。优化器对齐官方 AdamW（weight_decay=0.1，betas=(0.9,0.999)，eps=1e-8），使用设备上的标量学习率；默认不裁剪梯度。余弦调度按驾驶环境总步数进度计算，官方起止学习率相同，默认实际恒定，不再沿用 PPO 线性衰减。
-- `num_updates=2`、`learning_starts=10` 按完整向量等效步计算：异步返回累积到全部车辆槽位数才推进一次算法时钟，沿用官方零基计数 `step > learning_starts`。初始 reset 返回不作为已执行的动作步。测量预热同样使用向量步。每次更新采样 `minibatch_size / rollout_horizon` 个序列，微批次 16 个序列并累积梯度；补齐位置不计入损失。回合内位置 t 的窗口覆盖次数为 `min(t+1, rollout_horizon)`，损失乘以覆盖次数倒数，再除以采样序列总数。
+- `num_updates=2`、`learning_starts=10` 按完整向量等效步计算：异步返回累积到全部车辆槽位数才推进一次算法时钟，沿用官方零基计数 `step > learning_starts`。初始 reset 返回不作为已执行的动作步。测量预热同样使用向量步。每次更新采样 `fasttd3.batch_size / rollout_horizon` 个序列，微批次 16 个序列并累积梯度；补齐位置不计入损失。回合内位置 t 的窗口覆盖次数为 `min(t+1, rollout_horizon)`，损失乘以覆盖次数倒数，再除以采样序列总数。
 - 回放与 learner 同设备，CUDA 训练时采用 GPU float32 存储、批量归档和向量化采样，CPU 测试使用同一个实现。默认容量 1048576，向下取整为完整回合槽位，另存活跃轨迹；至少容纳每个车辆槽位的一条完整回合，环形覆盖按回合进行。按车辆和回合隔离，采样连续窗口，并从完整回合前缀重建 LSTM 状态；前缀不反向传播。终止后至场景重置前的数据不入回放。仅采样已完成轨迹会使最初的回放偏向短轨迹。
 - 新增可选 `capture_final_observations`：在自动重置/换地图之前保存最后观测和真实 terminal 标志。超时/换地图允许 bootstrap，真实 terminal 不允许；避免将新回合观测错误拼入 TD 目标。PPO 默认不启用。
 - 原评估器识别确定性 actor，直接执行其动作；原 PPO 的动作采样逻辑保留。
@@ -23,7 +23,7 @@
 ## 工程加速适配
 
 - 默认 `fasttd3.amp=True`、`amp_dtype=bf16`；网络前向和反向使用 autocast，FP16 模式才启用 GradScaler。参数、优化器状态、回放、LSTM 状态缓冲、C51 投影和概率损失保留 float32。原生环境接收 float32 动作。
-- 默认 `fasttd3.compile=True`、`compile_mode=reduce-overhead`，编译 Drive 编码器、actor/双 critic 网络、C51 投影和 actor/critic 损失计算。梯度缓冲区在图捕获外预分配，支持微批梯度累积。保留 eager cuDNN LSTM、CPU 长度、回放采样和优化器调度；这是分段编译，不是整个递归更新的单一 CUDA Graph。前缀先 pack 再编码，避免编码无效填充；编码器启用动态形状，保留全部 episode 历史。
+- 默认 `fasttd3.compile=True`、`compile_mode=reduce-overhead`，固定形状 Drive 编码、actor/双 critic 网络、C51 投影和 actor/critic 损失使用该模式。可变 episode 前缀单独动态编译、关闭其 CUDA Graph，避免每个长度录制一张图。梯度缓冲区在图捕获外预分配，支持微批累积。cuDNN packed LSTM、CPU 长度、采样及优化器调度保持 eager；不是整个递归更新的单一 CUDA Graph。前缀先 pack 再编码，保留全部 episode 历史。
 - 官方 `torch.set_float32_matmul_precision('high')`、AdamW、设备标量学习率、foreach 目标网络更新均已迁入。恢复原平台 `cudnn.benchmark=True`。每微批次不提取 loss 标量，只在更新结束汇总；packed LSTM 长度合并为每次优化更新一次 CPU 拷贝。
 - 观测归一化复用官方 EmpiricalNormalization，训练采集和有效回放数据更新统计，三个网络在一次更新中使用相同统计。道路类别 ID 原样保留；不改变原编码器结构。统计随 actor checkpoint 保存，评估不更新。回放中 padding 不参与统计；前缀只做归一化，不重复贡献统计。奖励入库前沿用平台 `clip(-1,1)`，不启用额外奖励归一化。所锁定官方训练代码中的动作/噪声裁剪和 C51 支持范围不等同于奖励裁剪。
 - 前一观测和动作留在 GPU，避免再次上传；本身位于 CPU 的驾驶环境仍须上传新观测/奖励并接收动作。cuDNN packed sequence 仍要求一次小型长度元数据拷贝，不能宣称训练循环完全无 CPU/GPU 同步。
@@ -38,13 +38,15 @@ python setup.py build_c --inplace --force
 python -m pufferlib.pufferl train puffer_drive --algorithm fasttd3 --env.action-type continuous
 ```
 
-checkpoint 包含模型、critic、目标 critic、优化器、配置和计数。保留原作分轮保存结构、trainer_state 和 W&B artifact。`--load-model-path` 可继续训练，恢复 learner、优化器及训练计数；环境和回放重新初始化并重新预热，不是精确轨迹续接。尚不支持通过 `--load-id` 下载并续训。加载须使用 checkpoint 中相同的网络尺寸和动力学配置，例如默认尺寸评估：
+checkpoint 包含模型、critic、目标 critic、优化器、配置、步数和 epoch。保留原作分轮保存结构、trainer_state 和 W&B artifact。`--load-model-path` 或配合原 W&B/Neptune 的 `--load-id` 可恢复 learner、优化器及计数；环境和回放重新初始化并重新预热，不是精确轨迹续接。二者不能同时指定。加载须使用 checkpoint 中相同的网络尺寸和动力学配置，例如默认尺寸评估：
 
 ```bash
-python -m pufferlib.pufferl eval puffer_drive --algorithm fasttd3 --env.action-type continuous --load-model-path experiments/puffer_drive_fasttd3_RUN_ID.pt
+python -m pufferlib.pufferl eval puffer_drive --algorithm fasttd3 --env.action-type continuous --load-model-path experiments/puffer_drive_RUN_ID.pt
 ```
 
 ## 小型验证
+
+2026-09-10 最终结果：**25 项通过（22 FastTD3 + 3 连续动作），进程退出码 0**。包含多进程退出断言；脚本通过 Bash 语法检查，但尚未在 AutoDL 执行。
 
 ```bash
 python -m unittest discover -s tests -p test_fasttd3.py -v
@@ -53,9 +55,9 @@ python -m unittest discover -s tests -p test_drive_continuous_actions.py -v
 
 测试使用随仓库提供的单个 sanity 场景重新序列化，不需要训练数据集。覆盖自动重置前观测、换地图 terminal 区分、回放边界、LSTM 前缀重建、延迟 actor 更新、串行/两个异步工作进程短训练、checkpoint 加载，以及第一阶段连续动作回归。包括 CPU 检查和可用时的 CUDA 短训练；不等同于完整数据集性能验证。
 
-本次修改文件：`pufferlib/fasttd3_train.py`、`pufferlib/fasttd3.py`、`pufferlib/config/ocean/drive.ini`、`pufferlib/utils.py`、`tests/test_fasttd3.py`、本说明和 `FASTTD3_PARITY_AUDIT.md`。这不是相对原始项目的全部文件清单。无需提交 `.so`、测试依赖、缓存或模型。
+2026-09-10 本轮修改：`pufferlib/fasttd3_train.py`、`pufferlib/fasttd3.py`、`pufferlib/pufferl.py`、`pufferlib/config/ocean/drive.ini`、`tests/test_fasttd3.py`、本说明和 `FASTTD3_PARITY_AUDIT.md`；新增 `scripts/run_fasttd3_smoke.sh`。这不是相对原始项目的全部文件清单。无需提交 `.so`、测试依赖、缓存或模型。
 
-本轮 22 项本地短测试通过（19 项 FastTD3、3 项连续动作）：新增异步时钟、奖励裁剪/SIGINT 保存、续训、WOSAC 子进程参数解析；CUDA 测试使用当前默认 reduce-overhead/BF16，实际执行 critic 和延迟 actor 更新。WOSAC 只验证调用和参数，未运行真实数据集评估。测试机器仍为本地 WSL/PyTorch 2.13/4060，不能替代目标服务器 PyTorch 2.8/5090 验收。
+上一轮 22 项本地短测试通过（19 项 FastTD3、3 项连续动作）；本轮增加官方标量参数对照、0–109 步前缀数值一致性和最终收尾采集检查，并强化多进程测试，要求 env.close 后工作进程确实退出。CUDA 测试实际执行编译/BF16 下的 critic 和延迟 actor 更新。WOSAC 只验证调用和参数，未运行真实数据集评估。测试机器仍为本地 WSL/PyTorch 2.13/4060，不能替代服务器 PyTorch 2.8/4090 或 5090 验收。
 
 ## 监控与保存恢复（2026-09-09）
 
@@ -65,14 +67,18 @@ python -m unittest discover -s tests -p test_drive_continuous_actions.py -v
 | `losses/*` | 记录分布式 critic loss 和确定性 actor loss；汇总本日志窗口的真实更新，未执行 actor 更新时不把占位零计入均值。PPO 的 GAE、entropy、clip、value loss 不适用于 FastTD3，不伪造这些指标。 |
 | `performance/*` | 复用原 `Profile(frequency=5)`，记录采集、环境等待、策略推理、学习耗时；`eval` 沿用原命名，指训练 rollout 采集，不是 HR/SP 评估。PPO 内部特有算子没有虚构对应计时。 |
 | 步数/epoch/SPS | 恢复 `agent_steps`、`epoch`、`uptime`、区间 `SPS`；保留已有 FastTD3 回放量、更新数、`SPS_train`。actor/critic 学习率分别记录。 |
-| 条件化数据 | 从活跃车辆最近一次原始采集观测记录 `data/lambda_mean/std` 和 lambda/碰撞奖励直方图。FastTD3 的样本来源不同于 PPO 的 on-policy minibatch；不虚构未执行的 BC anchor 熵和人类样本统计。 |
-| 有效数据比例 | `replay/valid_transition_fraction` 明确表示采集数据进入回放的比例；不能将重复回放采样称为 PPO 的 `environment/perc_transitions_used`。 |
+| 条件化数据 | 从最后一次真实训练 batch 的有效原始观测记录 `data/lambda_mean/std` 和 lambda/碰撞奖励直方图，恢复原训练样本含义；预热期间无训练样本便不伪造。BC anchor 熵及正则尚未迁入。 |
+| 有效数据比例 | `environment/perc_transitions_used` 表示本日志窗口训练 mask 有效位置数 / 采样位置数；`replay/valid_transition_fraction` 单独表示采集入库率。回放会重复采样，前者不表示不同环境转移的覆盖率。 |
 | 日志时机 | 保留 epoch 边界及原 0.25 秒节流，最终正常完成强制上报；没有新增每 10 次更新等频率。评估结果保留至实际日志上报。 |
 | HR/SP 评估、视频 | 使用原 Evaluator、开关和 `eval_interval`；保留评估前保存和失败标记保护。此次不降低评估间隔。 |
 | 模型保存/归档 | 按原 `checkpoint_interval` 保存编号模型、trainer_state 和 W&B checkpoint artifact；完成时上传最终模型。latest 文件采用临时文件替换。 |
 | W&B System | 继续由 SDK 自动记录；退出时关闭 W&B，避免没有 checkpoint 时漏掉 finish。 |
 
-默认日志仍需累计 524288 车辆步数后才首次上报训练曲线；SIGINT 中断时强制上报并保存，不等待下一个 epoch。步数恢复按原 recv mask 累加；另记 vector_steps 表示算法时钟。终端直接调用原 `PuffeRL.print_dashboard`，使用原 Utilization 监控线程，损失字段使用实际 FastTD3 指标。Fast 运行期间替换原强制退出的 SIGINT 处理，完成当前迭代后保存并关闭 logger，最后恢复原处理器；PPO 行为不改。
+默认每 524288 个 recv 槽位构成一个报告 epoch，agent_steps 按原 recv mask 累加；另记 vector_steps 表示算法时钟。SIGINT/SIGTERM 强制上报、保存并关闭 logger，不等待下个 epoch。终端直接调用原 `PuffeRL.print_dashboard` 和 Utilization；损失字段使用实际 FastTD3 指标，另补官方 qf_loss/qf_min/qf_max、梯度及奖励诊断。Fast 结束时恢复原信号处理器，PPO 行为不改。
+
+自然达到训练预算后沿用原作 32 个完整 rollout 的最终采集，新增 `train.final_rollouts=32` 表达原固定值；冻结优化器与归一化统计，保持训练 epoch，日志标记 `phase=final_collection`。这会额外增加默认 16,777,216 个采集槽位。定时测试收到信号直接保存退出，不执行该收尾。最终模型路径恢复原命名 `puffer_drive_RUN_ID.pt`，旧版本文件仍可按路径加载。
+
+`bash scripts/run_fasttd3_smoke.sh 1h --env.map-dir /实际地图目录` 可在已激活训练环境的 tmux 内运行。它沿用正式配置并启用 W&B，记录硬件/版本/源码哈希与退出码；不自动安装依赖或修改源码。到时发送 SIGINT，最多额外等待 120 秒收尾。退出码 124 表示到时，仍须核对日志中保存/退出标记；137 表示强制结束。此脚本不会证明训练性能达标。
 
 新增数值统计及日志接口回归：以替身 W&B SDK 验证真实 logger 收到分组指标、评估调用周期、分轮模型、trainer_state 和 artifact；不访问真实 W&B 服务。原生 HR/SP 评估由既有测试单独覆盖。现共 18 项短测试通过（15 项 FastTD3、3 项连续动作）；此结果不代表已验证服务器端 W&B 上传网络或网页面板布局。
 
@@ -121,7 +127,7 @@ python -m unittest discover -s tests -p test_drive_continuous_actions.py -v
 
 - `SPS` 已恢复为两次日志之间的车辆槽位步数增量/时间增量，包含该区间的评估和保存开销；第一段仍包含采集预热。首次编译会拉低第一段。
 - 后续测速应在预热完成、确实持续更新网络之后，用相同时间窗口计算增量步数/增量时间；同时记录有效车辆 transition、更新次数、有效学习样本数及峰值 RAM/VRAM。双方采用相同的评估/渲染/保存计时规则。
-- `SPS_train`：排除初始学习预热及评估/保存/日志开销；预热阈值为 `fasttd3.measure_burnin=3` 次更新。初次编译、其他形状重编译、GPU 缓存和回放逐渐填充仍可能影响短窗口，正式比较应选稳定运行区间。它与包含保存/评估的区间 `SPS` 不能混用。
+- `SPS_train`：排除初始学习预热及评估/保存/日志开销；在 `learning_starts + measure_burnin` 个完整向量等效步之后、环境步之前开始计时（默认 10+3）。初次编译、其他形状重编译、GPU 缓存和回放逐渐填充仍可能影响短窗口，正式比较应选稳定训练区间并排除 `final_collection`。它与包含保存/评估的区间 `SPS` 不能混用。
 - 当前回放位于训练设备，默认微批次 16 序列，开启编译和 AMP，但仍需重建 LSTM 前缀。正式地图与默认并发/大批次资源占用、完整训练效果，以及相对 PPO 的速度均待 AutoDL 实测。
 
 远端已核对提交 `95a521ac88f911dfe228a269d247eb91bb56fedf`。此后索引修复及监控恢复尚需同步。用户的 RTX 5090/PyTorch 2.8.0/CUDA 12.8 日志已记录 209 次 critic、104 次 actor 更新，GPU 后 10 分钟平均利用率约 10.55%；这证明可持续更新，不证明速度优势。此次监控恢复尚未在服务器实测。新增归一化状态意味着旧版 checkpoint 不能直接严格加载到新默认模型，旧模型请使用其对应代码评估。

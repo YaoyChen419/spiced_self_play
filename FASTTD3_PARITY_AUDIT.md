@@ -1,4 +1,45 @@
-# FastTD3 迁移一致性审查（2026-09-09）
+# FastTD3 迁移一致性审查（更新至 2026-09-10）
+
+## 本轮源码对照与处理结果
+
+通过 GitHub 插件重新核对以下固定版本，不以通用 TD3 的印象代替 FastTD3 源码：
+
+- [FastTD3 train.py](https://github.com/younggyoseo/FastTD3/blob/229ed59bbf43ea2f7a2d5d90d1076314839944d7/fast_td3/train.py)：更新顺序、AMP/scaler、延迟 actor 调度、Q/梯度统计及预热计时。
+- [FastTD3 网络与 C51](https://github.com/younggyoseo/FastTD3/blob/229ed59bbf43ea2f7a2d5d90d1076314839944d7/fast_td3/fast_td3.py)：直接导入官方 Actor/Critic/projection；在线 actor 生成目标动作，只有 target critic。
+- [spiced pufferl.py](https://github.com/Emerge-Lab/spiced_self_play/blob/b930fd664682cdd3298d60fa36d90e7bb373cf13/pufferlib/pufferl.py)：平台训练生命周期、仪表盘、统计、评估、保存及收尾。
+- 用户分支 `FastTD3` 的 learner 文件通过 GitHub 核对后在本地增量修改；本轮不提交、不推送。
+
+| 对照项 | 当前实现 / 必要限制 |
+| --- | --- |
+| 官方算法与标量参数 | 使用固定版本官方网络和 C51；对齐 AdamW、AMP、每个优化器的 scaler 步骤、CDQ、目标软更新、延迟 actor 调度（含 num_updates=1）；测试逐项核对官方 BaseArgs 默认值。 |
+| 平台配置 | 地图、奖励公式、`[-1,1]` 奖励裁剪、并发、Drive 编码器、LSTM 尺寸、评估周期保持；不为提高 SPS 减少官方更新数或批量。 |
+| 原生监控 | 复用 Rich dashboard、Utilization、Profile 和 logger；恢复原环境统计、真实训练样本条件直方图及训练 mask 比例；新增官方 Q/梯度/奖励诊断。PPO 专属损失不伪造。 |
+| 收尾和恢复 | 自然预算结束后恢复原 32 个完整 rollout 的最终采集，冻结学习与归一化统计，标记 `phase=final_collection`；SIGINT/SIGTERM 保存、上报并退出，不额外采集。checkpoint 保存 epoch；本地路径和 W&B/Neptune load-id 接回恢复入口。环境/replay 仍重新预热。 |
+| 日志与保存 | 本地原子保存和可读退出标记先于网络上传；最终路径恢复 `puffer_drive_RUN_ID.pt`。网络上传耗时从 SPS_train 排除，但保留在实际墙钟总耗时中。 |
+| 编译 | 可变 episode 前缀采用动态编译并关闭其 CUDA Graph；固定形状编码、head、投影和损失继续 reduce-overhead。前缀无截断，cuDNN packed LSTM 保留。 |
+| 测试留档 | `scripts/run_fasttd3_smoke.sh` 包装原训练入口，记录 GPU 型号/显存、软件版本、源码哈希、日志和退出码；不覆盖算法超参数。GPU 采样随训练退出关闭。 |
+
+本轮测试中发现新 SIGTERM 处理器被 fork 工作进程继承，会使原 `env.close()` 的 terminate 失效；已按 PID 区分，仅主 learner 执行保存收尾，子进程收到信号正常退出。多进程测试同时检查 worker 退出，不能只凭 unittest 打印 OK 判定收尾成功。
+
+### 不能逐字移植的部分：需作为实验方法说明
+
+1. **官方是无记忆 transition learner，本实验是 recurrent learner。** 独立 actor/critic/target 记忆、连续窗口、无梯度前缀重建、微批累积和窗口覆盖权重均为适配代码。episode 边界已获用户批准；仅使用已完成回合会改变初期样本分布。保留相同 LSTM 结构不等于保留 PPO 的学习过程。
+2. **官方完整更新编译不能直接套在 CPU Drive + packed LSTM 上。** 当前分段编译不包含回放采样、packed LSTM 和 Python 优化器调度；仍有 CPU/GPU 传输和重复前缀计算。因此不能承诺官方无记忆 GPU 环境的 SPS。
+3. **归一化的统计分布存在 recurrent 差异。** 道路类别 ID 不归一化；有效窗口中的重复观测参与官方 normalizer 统计，前缀/padding 不贡献统计，三个网络共用一次更新内的快照。它不同于官方均匀 transition 样本序列，不能只凭开关相同宣称完全等价。
+4. **离散 BC anchor 的 KL/熵不能直接变成确定性连续策略正则。** 当前明确限定固定 λ0；anchor30、anchor_entropy 和人类数据正则尚未迁入，不能静默忽略非零 λ。后续需另行确定连续分布/anchor 适配方案。
+5. **多 learner/DDP、原 PPO 专用二进制导出没有迁移。** 当前支持单 GPU learner + 原多环境工作进程；评估走 Python actor 接口。官方 Humanoid 专属环境、奖励归一化分支等不替换 Drive 平台设置。
+
+### 验证与性能证据的界限
+
+本地短测试检查数值更新、记忆边界、恢复、原生评估及日志合同，不能证明完整地图收敛或速度优势。在线 W&B 下载/上传、真实视频/WOSAC、目标 PyTorch 2.8/CUDA 12.8 的完整规模运行仍需服务器验收。
+
+本轮最终验证：22 项 FastTD3 + 3 项连续动作测试全部通过，测试进程退出码 0；多进程用例明确检查 worker 已退出。Bash `-n` 语法检查和 `git diff --check` 通过。测试包装脚本未在 AutoDL 实际运行；W&B 使用替身 SDK 验证日志与 artifact 合同，load-id 在线下载未实际验证。
+
+用户已确认最新短测 GPU 是 **4090 24GB**；最终计划的 **5090 32GB** 属不同机器，必须分开比较。此前 `gpu (1).csv` 包含训练退出后的长段空闲，整文件平均利用率不是训练利用率；模型有更新状态也不证明 W&B/进程正常收尾。
+
+---
+
+## 以下保留 2026-09-09 历史审查快照（不是当前状态）
 
 ## 修复进度（原审查快照保留在下方）
 
