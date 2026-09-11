@@ -282,6 +282,20 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
     int init_steps = unpack(kwargs, "init_steps");
+    PyObject *final_obs = PyDict_GetItemString(kwargs, "final_observations");
+    if (final_obs && final_obs != Py_None) {
+        int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
+        int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
+                      ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        if (!PyArray_Check(final_obs) || PyArray_TYPE((PyArrayObject *)final_obs) != NPY_FLOAT32 ||
+            !PyArray_ISCARRAY((PyArrayObject *)final_obs) || PyArray_NDIM((PyArrayObject *)final_obs) != 2 ||
+            PyArray_DIM((PyArrayObject *)final_obs, 0) != max_agents ||
+            PyArray_DIM((PyArrayObject *)final_obs, 1) != obs_dim) {
+            PyErr_SetString(PyExc_ValueError, "final_observations must be a writable contiguous float32 [agents, obs] array");
+            return -1;
+        }
+        env->final_observations = PyArray_DATA((PyArrayObject *)final_obs);
+    }
     char map_file[512];
     snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
     env->num_agents = max_agents;
