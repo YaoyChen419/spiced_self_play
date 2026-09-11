@@ -335,6 +335,7 @@ if not NO_TRAIN:
         "wandb",
         "matplotlib",
         "tqdm",
+        "tensordict==0.7.2",
     ]
 
 setup(
