@@ -41,9 +41,7 @@ from pufferlib.ocean.benchmark.evaluator import Evaluator
 try:
     from pufferlib import _C
 except ImportError:
-    raise ImportError(
-        "Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation"
-    )
+    _C = None
 
 import rich
 import rich.traceback
@@ -1227,6 +1225,23 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
+
+    if args["train"].get("agent") == "fasttd3":
+        from pufferlib.fast_td3_train import train as train_fast_td3
+
+        return train_fast_td3(
+            env_name=env_name,
+            args=args,
+            vecenv=vecenv,
+            policy=policy,
+            logger=logger,
+        )
+
+    if _C is None:
+        raise ImportError(
+            "PPO requires the C/CUDA advantage kernel; "
+            "rebuild with --no-build-isolation"
+        )
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
     if "LOCAL_RANK" in os.environ:
