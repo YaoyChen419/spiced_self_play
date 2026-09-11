@@ -1321,6 +1321,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
     args = args or load_config(env_name)
     args["env"]["termination_mode"] = 0
+    fasttd3 = args["train"].get("agent") == "fasttd3"
 
     wosac_enabled = args["eval"]["wosac_realism_eval"]
 
@@ -1349,13 +1350,25 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         # Create environment and policy
         vecenv = vecenv or load_env(env_name, args)
-        policy = policy or load_policy(args, vecenv, env_name)
+        obs_normalizer = None
+        if fasttd3:
+            if policy is None:
+                policy, obs_normalizer = load_policy(args, vecenv, env_name)
+            else:
+                policy, obs_normalizer = policy
+        else:
+            policy = policy or load_policy(args, vecenv, env_name)
 
         # Make eval class instance
         evaluator = WOSACEvaluator(args)
 
         # Obtain scores
-        df_results = evaluator.evaluate(args, vecenv, policy)
+        df_results = evaluator.evaluate(
+            args,
+            vecenv,
+            policy,
+            obs_normalizer=obs_normalizer,
+        )
 
         # Average results over scenarios
         results_dict = df_results.mean().to_dict()
@@ -1381,7 +1394,14 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         # Create environment and policy
         vecenv = vecenv or load_env(env_name, args)
-        policy = policy or load_policy(args, vecenv, env_name)
+        obs_normalizer = None
+        if fasttd3:
+            if policy is None:
+                policy, obs_normalizer = load_policy(args, vecenv, env_name)
+            else:
+                policy, obs_normalizer = policy
+        else:
+            policy = policy or load_policy(args, vecenv, env_name)
 
         # Reset environment
         ob, info = vecenv.reset()
@@ -1390,7 +1410,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         device = args["train"]["device"]
 
         state = {}
-        if args["train"]["use_rnn"]:
+        if args["train"]["use_rnn"] and not fasttd3:
             state = dict(
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -1405,16 +1425,22 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
-                logits, value = policy.forward_eval(ob, state)
-
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                if fasttd3:
+                    if isinstance(obs_normalizer, torch.nn.Identity):
+                        normalized_ob = obs_normalizer(ob)
+                    else:
+                        normalized_ob = obs_normalizer(ob, update=False)
+                    action = policy(normalized_ob)
+                else:
+                    logits, value = policy.forward_eval(ob, state)
+                    action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
 
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
-            if isinstance(logits, torch.distributions.Normal):
+            if not fasttd3 and isinstance(logits, torch.distributions.Normal):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
-            obs, reward, terminal, truncated, info = vecenv.step(action)
+            ob, reward, terminal, truncated, info = vecenv.step(action)
 
             if driver.render_mode == 1:
                 frame_count += 1
@@ -1748,7 +1774,76 @@ def _load_state_dict(checkpoint, device):
     return {k.replace("module.", ""): v for k, v in state_dict.items()}
 
 
+def load_fasttd3_policy(args, vecenv, env_name=""):
+    from pufferlib.fast_td3 import Actor
+    from pufferlib.fast_td3_utils import EmpiricalNormalization
+
+    device = args["train"]["device"]
+    load_path = args["load_model_path"]
+    load_id = args["load_id"]
+
+    if load_id is not None:
+        if args["neptune"]:
+            load_path = NeptuneLogger(args, load_id, mode="read-only").download()
+        elif args["wandb"]:
+            load_path = WandbLogger(args, load_id).download()
+        else:
+            raise pufferlib.APIUsageError("No run id provided for eval")
+
+    if load_path == "latest":
+        checkpoint_pattern = os.path.join(
+            args["train"]["data_dir"],
+            f"{env_name}_*",
+            f"model_{env_name}_*.pt",
+        )
+        checkpoints = glob.glob(checkpoint_pattern)
+        if not checkpoints:
+            raise pufferlib.APIUsageError(
+                f"No FastTD3 checkpoints found for {env_name}"
+            )
+        load_path = max(checkpoints, key=os.path.getctime)
+
+    if load_path is None:
+        raise pufferlib.APIUsageError(
+            "FastTD3 evaluation requires --load-model-path or --load-id"
+        )
+
+    checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+    checkpoint_args = checkpoint["args"]
+    actor_state = checkpoint["actor_state_dict"]
+    n_obs = actor_state["net.0.weight"].shape[-1]
+    n_act = actor_state["fc_mu.0.weight"].shape[0]
+
+    actor = Actor(
+        n_obs=n_obs,
+        n_act=n_act,
+        num_envs=checkpoint_args["num_envs"],
+        init_scale=checkpoint_args["init_scale"],
+        hidden_dim=checkpoint_args["actor_hidden_dim"],
+        std_min=checkpoint_args["std_min"],
+        std_max=checkpoint_args["std_max"],
+        sim_type=checkpoint_args["sim_type"],
+        sim_dimension=checkpoint_args["sim_dimension"],
+        seq_len=checkpoint_args["actor_seq_len"],
+        device=device,
+    )
+    actor.load_state_dict(actor_state)
+    actor.eval()
+
+    if checkpoint_args["obs_normalization"]:
+        obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+        obs_normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
+    else:
+        obs_normalizer = torch.nn.Identity()
+    obs_normalizer.eval()
+
+    return actor, obs_normalizer
+
+
 def load_policy(args, vecenv, env_name=""):
+    if args["train"].get("agent") == "fasttd3":
+        return load_fasttd3_policy(args, vecenv, env_name)
+
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)

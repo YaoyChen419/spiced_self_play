@@ -106,24 +106,6 @@ class PufferDriveEnv:
         return observations, rewards, dones, info
 
 
-class FastTD3Policy(nn.Module):
-    """Thin evaluator view over the original deterministic FastTD3 actor."""
-
-    is_deterministic = True
-
-    def __init__(self, actor, obs_normalizer):
-        super().__init__()
-        self.actor = actor
-        self.obs_normalizer = obs_normalizer
-
-    def forward_eval(self, observations, state):
-        if isinstance(self.obs_normalizer, nn.Identity):
-            normalized = observations
-        else:
-            normalized = self.obs_normalizer(observations, update=False)
-        return self.actor(normalized)
-
-
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     from pufferlib.pufferl import (
         NoLogger,
@@ -389,12 +371,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         from pufferlib.ocean.benchmark.evaluator import Evaluator
 
         evaluator = Evaluator(full_args, logger)
-        eval_policy = FastTD3Policy(actor, obs_normalizer)
 
         if full_args["eval"]["human_replay_eval"]:
             evaluator.hr_env = load_env("puffer_drive", evaluator.hr_eval_config)
             try:
-                evaluator.rollout(eval_policy, mode="human_replay")
+                evaluator.rollout(
+                    actor,
+                    mode="human_replay",
+                    obs_normalizer=obs_normalizer,
+                )
             except Exception as error:
                 print(f"Render failed (non-fatal): {error}")
             evaluator.hr_env.driver_env.stop_recorder(0)
@@ -404,7 +389,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if full_args["eval"]["self_play_eval"]:
             evaluator.sp_env = load_env("puffer_drive", evaluator.sp_eval_config)
             try:
-                evaluator.rollout(eval_policy, mode="self_play")
+                evaluator.rollout(
+                    actor,
+                    mode="self_play",
+                    obs_normalizer=obs_normalizer,
+                )
             except Exception as error:
                 print(f"Render failed (non-fatal): {error}")
             evaluator.sp_env.driver_env.stop_recorder(0)

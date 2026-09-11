@@ -49,7 +49,14 @@ class WOSACEvaluator:
         self.metrics_config.read(wosac_metrics_path)
         self.mode = "rl"
 
-    def evaluate(self, args, vecenv, policy=None, drop_scene_duplicates=False):
+    def evaluate(
+        self,
+        args,
+        vecenv,
+        policy=None,
+        drop_scene_duplicates=False,
+        obs_normalizer=None,
+    ):
         """Run full WOSAC evaluation with batched iteration over target scenarios.
 
         Args:
@@ -81,7 +88,12 @@ class WOSACEvaluator:
 
             # Collect simulated trajectories
             if policy is not None and self.eval_mode == "policy":
-                simulated_trajectories = self.collect_simulated_trajectories(args, vecenv, policy)
+                simulated_trajectories = self.collect_simulated_trajectories(
+                    args,
+                    vecenv,
+                    policy,
+                    obs_normalizer=obs_normalizer,
+                )
             elif self.eval_mode == "ground_truth":
                 # Create fake simulated trajectories by repeating ground truth
                 simulated_trajectories = gt_trajectories.copy()
@@ -163,7 +175,14 @@ class WOSACEvaluator:
         """
         return puffer_env.get_ground_truth_trajectories()
 
-    def collect_simulated_trajectories(self, args, puffer_env, policy=None, actions=None):
+    def collect_simulated_trajectories(
+        self,
+        args,
+        puffer_env,
+        policy=None,
+        actions=None,
+        obs_normalizer=None,
+    ):
         """Roll out policy in env and collect trajectories.
         Args:
             args: configuration dictionary
@@ -197,7 +216,11 @@ class WOSACEvaluator:
             truncations = np.zeros((num_agents,), dtype=bool)
             state = {}
 
-            if args["train"]["use_rnn"] and policy is not None:
+            if (
+                args["train"]["use_rnn"]
+                and policy is not None
+                and obs_normalizer is None
+            ):
                 state = dict(
                     lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                     lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -236,16 +259,21 @@ class WOSACEvaluator:
                     else:
                         with torch.no_grad():
                             ob_tensor = torch.as_tensor(obs).to(device)
-                            if getattr(policy, "is_deterministic", False):
-                                action = policy.forward_eval(ob_tensor, state)
+                            if obs_normalizer is not None:
+                                if isinstance(obs_normalizer, torch.nn.Identity):
+                                    normalized_obs = obs_normalizer(ob_tensor)
+                                else:
+                                    normalized_obs = obs_normalizer(
+                                        ob_tensor,
+                                        update=False,
+                                    )
+                                action = policy(normalized_obs)
                             else:
                                 logits, value = policy.forward_eval(ob_tensor, state)
                                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                             action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
-                        if not getattr(policy, "is_deterministic", False) and isinstance(
-                            logits, torch.distributions.Normal
-                        ):
+                        if obs_normalizer is None and isinstance(logits, torch.distributions.Normal):
                             action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
                 obs, rewards, terminals, truncations, infos = puffer_env.step(action_np)
@@ -893,7 +921,13 @@ class Evaluator:
         # Add other modes based on desiderata here
         return 0
 
-    def rollout(self, policy, mode="self_play", view_mode=None):
+    def rollout(
+        self,
+        policy,
+        mode="self_play",
+        view_mode=None,
+        obs_normalizer=None,
+    ):
         from pufferlib.ocean.drive.drive import RenderView
 
         if view_mode is None:
@@ -906,7 +940,13 @@ class Evaluator:
         needs_stats_first = render_eval and self.render_select_mode not in (self.RENDER_FIRST, self.RENDER_RANDOM)
 
         if needs_stats_first:
-            env_logs = self._run_rollout(policy, env, per_env_logs=True)
+            env_logs = self._run_rollout(
+                policy,
+                env,
+                mode,
+                per_env_logs=True,
+                obs_normalizer=obs_normalizer,
+            )
             render_env_idx = self.select_render_env(env_logs)
 
         else:
@@ -919,6 +959,7 @@ class Evaluator:
             render_env_idx if render_eval else None,
             per_env_logs=True,
             view_mode=view_mode,
+            obs_normalizer=obs_normalizer,
         )
 
         if mode == "self_play":
@@ -928,7 +969,16 @@ class Evaluator:
             self.human_replay_stats = env_statistics
             self.human_replay_stats[0]["render_env_idx"] = render_env_idx
 
-    def _run_rollout(self, policy, env, mode, render_env_idx=None, per_env_logs=False, view_mode=None):
+    def _run_rollout(
+        self,
+        policy,
+        env,
+        mode,
+        render_env_idx=None,
+        per_env_logs=False,
+        view_mode=None,
+        obs_normalizer=None,
+    ):
         """Run a single rollout. If render_env_idx is not None, render that env."""
         from pufferlib.ocean.drive.drive import RenderView
 
@@ -945,7 +995,7 @@ class Evaluator:
 
         # Initialize RNN state if needed
         state = {}
-        if self.configs["train"]["use_rnn"]:
+        if self.configs["train"]["use_rnn"] and obs_normalizer is None:
             state = dict(
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -961,17 +1011,19 @@ class Evaluator:
             # Get action from policy
             with torch.no_grad():
                 ob_tensor = torch.as_tensor(obs).to(device)
-                if getattr(policy, "is_deterministic", False):
-                    action = policy.forward_eval(ob_tensor, state)
+                if obs_normalizer is not None:
+                    if isinstance(obs_normalizer, torch.nn.Identity):
+                        normalized_obs = obs_normalizer(ob_tensor)
+                    else:
+                        normalized_obs = obs_normalizer(ob_tensor, update=False)
+                    action = policy(normalized_obs)
                 else:
                     logits, value = policy.forward_eval(ob_tensor, state)
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action_np = action.cpu().numpy().reshape(env.action_space.shape)
 
             # Clip continuous actions to valid range
-            if not getattr(policy, "is_deterministic", False) and isinstance(
-                logits, torch.distributions.Normal
-            ):
+            if obs_normalizer is None and isinstance(logits, torch.distributions.Normal):
                 action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
 
             # Step environment
