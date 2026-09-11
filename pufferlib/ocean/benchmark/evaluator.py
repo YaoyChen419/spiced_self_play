@@ -236,11 +236,16 @@ class WOSACEvaluator:
                     else:
                         with torch.no_grad():
                             ob_tensor = torch.as_tensor(obs).to(device)
-                            logits, value = policy.forward_eval(ob_tensor, state)
-                            action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                            if getattr(policy, "is_deterministic", False):
+                                action = policy.forward_eval(ob_tensor, state)
+                            else:
+                                logits, value = policy.forward_eval(ob_tensor, state)
+                                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                             action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
-                        if isinstance(logits, torch.distributions.Normal):
+                        if not getattr(policy, "is_deterministic", False) and isinstance(
+                            logits, torch.distributions.Normal
+                        ):
                             action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
                 obs, rewards, terminals, truncations, infos = puffer_env.step(action_np)
@@ -956,12 +961,17 @@ class Evaluator:
             # Get action from policy
             with torch.no_grad():
                 ob_tensor = torch.as_tensor(obs).to(device)
-                logits, value = policy.forward_eval(ob_tensor, state)
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                if getattr(policy, "is_deterministic", False):
+                    action = policy.forward_eval(ob_tensor, state)
+                else:
+                    logits, value = policy.forward_eval(ob_tensor, state)
+                    action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action_np = action.cpu().numpy().reshape(env.action_space.shape)
 
             # Clip continuous actions to valid range
-            if isinstance(logits, torch.distributions.Normal):
+            if not getattr(policy, "is_deterministic", False) and isinstance(
+                logits, torch.distributions.Normal
+            ):
                 action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
 
             # Step environment
