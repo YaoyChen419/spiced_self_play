@@ -23,12 +23,17 @@ class SimpleReplayBuffer(nn.Module):
         gamma: float = 0.99,
         device=None,
     ):
-        super().__init__()
+        """
+        A simple replay buffer that stores transitions in a circular buffer.
+        Supports n-step returns and asymmetric observations.
 
-        if n_steps != 1:
-            raise ValueError(
-                "SPiCED FastTD3 replay buffer currently requires num_steps = 1"
-            )
+        When playground_mode=True, critic_observations are treated as a concatenation of
+        regular observations and privileged observations, and only the privileged part is stored
+        to save memory.
+
+        TODO (Younggyo): Refactor to split this into SimpleReplayBuffer and NStepReplayBuffer
+        """
+        super().__init__()
 
         self.n_env = n_env
         self.buffer_size = buffer_size
@@ -37,104 +42,338 @@ class SimpleReplayBuffer(nn.Module):
         self.n_critic_obs = n_critic_obs
         self.asymmetric_obs = asymmetric_obs
         self.playground_mode = playground_mode and asymmetric_obs
-        self.n_steps = n_steps
         self.gamma = gamma
+        self.n_steps = n_steps
         self.device = device
 
         self.observations = torch.zeros(
-            (buffer_size, n_obs),
-            device=device,
-            dtype=torch.float,
+            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
         )
         self.actions = torch.zeros(
-            (buffer_size, n_act),
-            device=device,
-            dtype=torch.float,
+            (n_env, buffer_size, n_act), device=device, dtype=torch.float
         )
         self.rewards = torch.zeros(
-            buffer_size,
-            device=device,
-            dtype=torch.float,
+            (n_env, buffer_size), device=device, dtype=torch.float
         )
-        self.dones = torch.zeros(
-            buffer_size,
-            device=device,
-            dtype=torch.long,
-        )
+        self.dones = torch.zeros((n_env, buffer_size), device=device, dtype=torch.long)
         self.truncations = torch.zeros(
-            buffer_size,
-            device=device,
-            dtype=torch.long,
+            (n_env, buffer_size), device=device, dtype=torch.long
         )
         self.next_observations = torch.zeros(
-            (buffer_size, n_obs),
-            device=device,
-            dtype=torch.float,
+            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
         )
-
         if asymmetric_obs:
-            self.critic_observations = torch.zeros(
-                (buffer_size, n_critic_obs),
-                device=device,
-                dtype=torch.float,
-            )
-            self.next_critic_observations = torch.zeros(
-                (buffer_size, n_critic_obs),
-                device=device,
-                dtype=torch.float,
-            )
-
+            if self.playground_mode:
+                # Only store the privileged part of observations (n_critic_obs - n_obs)
+                self.privileged_obs_size = n_critic_obs - n_obs
+                self.privileged_observations = torch.zeros(
+                    (n_env, buffer_size, self.privileged_obs_size),
+                    device=device,
+                    dtype=torch.float,
+                )
+                self.next_privileged_observations = torch.zeros(
+                    (n_env, buffer_size, self.privileged_obs_size),
+                    device=device,
+                    dtype=torch.float,
+                )
+            else:
+                # Store full critic observations
+                self.critic_observations = torch.zeros(
+                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                )
+                self.next_critic_observations = torch.zeros(
+                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                )
         self.ptr = 0
-        self.size = 0
 
     @torch.no_grad()
-    def extend(self, tensor_dict: TensorDict):
-        batch_size = tensor_dict["observations"].shape[0]
+    def extend(
+        self,
+        tensor_dict: TensorDict,
+    ):
+        observations = tensor_dict["observations"]
+        actions = tensor_dict["actions"]
+        rewards = tensor_dict["next"]["rewards"]
+        dones = tensor_dict["next"]["dones"]
+        truncations = tensor_dict["next"]["truncations"]
+        next_observations = tensor_dict["next"]["observations"]
 
-        if batch_size >= self.buffer_size:
-            tensor_dict = tensor_dict[-self.buffer_size :]
-            batch_size = self.buffer_size
-
-        indices = (
-            torch.arange(batch_size, device=self.device) + self.ptr
-        ) % self.buffer_size
-
-        self.observations[indices] = tensor_dict["observations"]
-        self.actions[indices] = tensor_dict["actions"]
-        self.rewards[indices] = tensor_dict["next"]["rewards"]
-        self.dones[indices] = tensor_dict["next"]["dones"]
-        self.truncations[indices] = tensor_dict["next"]["truncations"]
-        self.next_observations[indices] = tensor_dict["next"]["observations"]
-
+        ptr = self.ptr % self.buffer_size
+        self.observations[:, ptr] = observations
+        self.actions[:, ptr] = actions
+        self.rewards[:, ptr] = rewards
+        self.dones[:, ptr] = dones
+        self.truncations[:, ptr] = truncations
+        self.next_observations[:, ptr] = next_observations
         if self.asymmetric_obs:
-            self.critic_observations[indices] = tensor_dict[
-                "critic_observations"
-            ]
-            self.next_critic_observations[indices] = tensor_dict["next"][
-                "critic_observations"
-            ]
+            critic_observations = tensor_dict["critic_observations"]
+            next_critic_observations = tensor_dict["next"]["critic_observations"]
 
-        self.ptr = (self.ptr + batch_size) % self.buffer_size
-        self.size = min(self.size + batch_size, self.buffer_size)
+            if self.playground_mode:
+                # Extract and store only the privileged part
+                privileged_observations = critic_observations[:, self.n_obs :]
+                next_privileged_observations = next_critic_observations[:, self.n_obs :]
+                self.privileged_observations[:, ptr] = privileged_observations
+                self.next_privileged_observations[:, ptr] = next_privileged_observations
+            else:
+                # Store full critic observations
+                self.critic_observations[:, ptr] = critic_observations
+                self.next_critic_observations[:, ptr] = next_critic_observations
+        self.ptr += 1
 
     @torch.no_grad()
     def sample(self, batch_size: int):
-        if self.size == 0:
-            raise RuntimeError("Cannot sample from an empty replay buffer")
+        # we will sample n_env * batch_size transitions
 
-        indices = torch.randint(
-            0,
-            self.size,
-            (batch_size,),
-            device=self.device,
-        )
+        if self.n_steps == 1:
+            indices = torch.randint(
+                0,
+                min(self.buffer_size, self.ptr),
+                (self.n_env, batch_size),
+                device=self.device,
+            )
+            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
+            act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
+            observations = torch.gather(self.observations, 1, obs_indices).reshape(
+                self.n_env * batch_size, self.n_obs
+            )
+            next_observations = torch.gather(
+                self.next_observations, 1, obs_indices
+            ).reshape(self.n_env * batch_size, self.n_obs)
+            actions = torch.gather(self.actions, 1, act_indices).reshape(
+                self.n_env * batch_size, self.n_act
+            )
 
-        observations = self.observations[indices]
-        actions = self.actions[indices]
-        rewards = self.rewards[indices]
-        dones = self.dones[indices]
-        truncations = self.truncations[indices]
-        next_observations = self.next_observations[indices]
+            rewards = torch.gather(self.rewards, 1, indices).reshape(
+                self.n_env * batch_size
+            )
+            dones = torch.gather(self.dones, 1, indices).reshape(
+                self.n_env * batch_size
+            )
+            truncations = torch.gather(self.truncations, 1, indices).reshape(
+                self.n_env * batch_size
+            )
+            effective_n_steps = torch.ones_like(dones)
+            if self.asymmetric_obs:
+                if self.playground_mode:
+                    # Gather privileged observations
+                    priv_obs_indices = indices.unsqueeze(-1).expand(
+                        -1, -1, self.privileged_obs_size
+                    )
+                    privileged_observations = torch.gather(
+                        self.privileged_observations, 1, priv_obs_indices
+                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
+                    next_privileged_observations = torch.gather(
+                        self.next_privileged_observations, 1, priv_obs_indices
+                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
+
+                    # Concatenate with regular observations to form full critic observations
+                    critic_observations = torch.cat(
+                        [observations, privileged_observations], dim=1
+                    )
+                    next_critic_observations = torch.cat(
+                        [next_observations, next_privileged_observations], dim=1
+                    )
+                else:
+                    # Gather full critic observations
+                    critic_obs_indices = indices.unsqueeze(-1).expand(
+                        -1, -1, self.n_critic_obs
+                    )
+                    critic_observations = torch.gather(
+                        self.critic_observations, 1, critic_obs_indices
+                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
+                    next_critic_observations = torch.gather(
+                        self.next_critic_observations, 1, critic_obs_indices
+                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
+        else:
+            # Sample base indices
+            if self.ptr >= self.buffer_size:
+                # When the buffer is full, there is no protection against sampling across different episodes
+                # We avoid this by temporarily setting self.pos - 1 to truncated = True if not done
+                # https://github.com/DLR-RM/stable-baselines3/blob/b91050ca94f8bce7a0285c91f85da518d5a26223/stable_baselines3/common/buffers.py#L857-L860
+                # TODO (Younggyo): Change the reference when this SB3 branch is merged
+                current_pos = self.ptr % self.buffer_size
+                curr_truncations = self.truncations[:, current_pos - 1].clone()
+                self.truncations[:, current_pos - 1] = torch.logical_not(
+                    self.dones[:, current_pos - 1]
+                )
+                indices = torch.randint(
+                    0,
+                    self.buffer_size,
+                    (self.n_env, batch_size),
+                    device=self.device,
+                )
+            else:
+                # Buffer not full - ensure n-step sequence doesn't exceed valid data
+                max_start_idx = max(1, self.ptr - self.n_steps + 1)
+                indices = torch.randint(
+                    0,
+                    max_start_idx,
+                    (self.n_env, batch_size),
+                    device=self.device,
+                )
+            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
+            act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
+
+            # Get base transitions
+            observations = torch.gather(self.observations, 1, obs_indices).reshape(
+                self.n_env * batch_size, self.n_obs
+            )
+            actions = torch.gather(self.actions, 1, act_indices).reshape(
+                self.n_env * batch_size, self.n_act
+            )
+            if self.asymmetric_obs:
+                if self.playground_mode:
+                    # Gather privileged observations
+                    priv_obs_indices = indices.unsqueeze(-1).expand(
+                        -1, -1, self.privileged_obs_size
+                    )
+                    privileged_observations = torch.gather(
+                        self.privileged_observations, 1, priv_obs_indices
+                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
+
+                    # Concatenate with regular observations to form full critic observations
+                    critic_observations = torch.cat(
+                        [observations, privileged_observations], dim=1
+                    )
+                else:
+                    # Gather full critic observations
+                    critic_obs_indices = indices.unsqueeze(-1).expand(
+                        -1, -1, self.n_critic_obs
+                    )
+                    critic_observations = torch.gather(
+                        self.critic_observations, 1, critic_obs_indices
+                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
+
+            # Create sequential indices for each sample
+            # This creates a [n_env, batch_size, n_step] tensor of indices
+            seq_offsets = torch.arange(self.n_steps, device=self.device).view(1, 1, -1)
+            all_indices = (
+                indices.unsqueeze(-1) + seq_offsets
+            ) % self.buffer_size  # [n_env, batch_size, n_step]
+
+            # Gather all rewards and terminal flags
+            # Using advanced indexing - result shapes: [n_env, batch_size, n_step]
+            all_rewards = torch.gather(
+                self.rewards.unsqueeze(-1).expand(-1, -1, self.n_steps), 1, all_indices
+            )
+            all_dones = torch.gather(
+                self.dones.unsqueeze(-1).expand(-1, -1, self.n_steps), 1, all_indices
+            )
+            all_truncations = torch.gather(
+                self.truncations.unsqueeze(-1).expand(-1, -1, self.n_steps),
+                1,
+                all_indices,
+            )
+
+            # Create masks for rewards *after* first done
+            # This creates a cumulative product that zeroes out rewards after the first done
+            all_dones_shifted = torch.cat(
+                [torch.zeros_like(all_dones[:, :, :1]), all_dones[:, :, :-1]], dim=2
+            )  # First reward should not be masked
+            done_masks = torch.cumprod(
+                1.0 - all_dones_shifted, dim=2
+            )  # [n_env, batch_size, n_step]
+            effective_n_steps = done_masks.sum(2)
+
+            # Create discount factors
+            discounts = torch.pow(
+                self.gamma, torch.arange(self.n_steps, device=self.device)
+            )  # [n_steps]
+
+            # Apply masks and discounts to rewards
+            masked_rewards = all_rewards * done_masks  # [n_env, batch_size, n_step]
+            discounted_rewards = masked_rewards * discounts.view(
+                1, 1, -1
+            )  # [n_env, batch_size, n_step]
+
+            # Sum rewards along the n_step dimension
+            n_step_rewards = discounted_rewards.sum(dim=2)  # [n_env, batch_size]
+
+            # Find index of first done or truncation or last step for each sequence
+            first_done = torch.argmax(
+                (all_dones > 0).float(), dim=2
+            )  # [n_env, batch_size]
+            first_trunc = torch.argmax(
+                (all_truncations > 0).float(), dim=2
+            )  # [n_env, batch_size]
+
+            # Handle case where there are no dones or truncations
+            no_dones = all_dones.sum(dim=2) == 0
+            no_truncs = all_truncations.sum(dim=2) == 0
+
+            # When no dones or truncs, use the last index
+            first_done = torch.where(no_dones, self.n_steps - 1, first_done)
+            first_trunc = torch.where(no_truncs, self.n_steps - 1, first_trunc)
+
+            # Take the minimum (first) of done or truncation
+            final_indices = torch.minimum(
+                first_done, first_trunc
+            )  # [n_env, batch_size]
+
+            # Create indices to gather the final next observations
+            final_next_obs_indices = torch.gather(
+                all_indices, 2, final_indices.unsqueeze(-1)
+            ).squeeze(
+                -1
+            )  # [n_env, batch_size]
+
+            # Gather final values
+            final_next_observations = self.next_observations.gather(
+                1, final_next_obs_indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
+            )
+            final_dones = self.dones.gather(1, final_next_obs_indices)
+            final_truncations = self.truncations.gather(1, final_next_obs_indices)
+
+            if self.asymmetric_obs:
+                if self.playground_mode:
+                    # Gather final privileged observations
+                    final_next_privileged_observations = (
+                        self.next_privileged_observations.gather(
+                            1,
+                            final_next_obs_indices.unsqueeze(-1).expand(
+                                -1, -1, self.privileged_obs_size
+                            ),
+                        )
+                    )
+
+                    # Reshape for output
+                    next_privileged_observations = (
+                        final_next_privileged_observations.reshape(
+                            self.n_env * batch_size, self.privileged_obs_size
+                        )
+                    )
+
+                    # Concatenate with next observations to form full next critic observations
+                    next_observations_reshaped = final_next_observations.reshape(
+                        self.n_env * batch_size, self.n_obs
+                    )
+                    next_critic_observations = torch.cat(
+                        [next_observations_reshaped, next_privileged_observations],
+                        dim=1,
+                    )
+                else:
+                    # Gather final next critic observations directly
+                    final_next_critic_observations = (
+                        self.next_critic_observations.gather(
+                            1,
+                            final_next_obs_indices.unsqueeze(-1).expand(
+                                -1, -1, self.n_critic_obs
+                            ),
+                        )
+                    )
+                    next_critic_observations = final_next_critic_observations.reshape(
+                        self.n_env * batch_size, self.n_critic_obs
+                    )
+
+            # Reshape everything to batch dimension
+            rewards = n_step_rewards.reshape(self.n_env * batch_size)
+            dones = final_dones.reshape(self.n_env * batch_size)
+            truncations = final_truncations.reshape(self.n_env * batch_size)
+            effective_n_steps = effective_n_steps.reshape(self.n_env * batch_size)
+            next_observations = final_next_observations.reshape(
+                self.n_env * batch_size, self.n_obs
+            )
 
         out = TensorDict(
             {
@@ -145,19 +384,18 @@ class SimpleReplayBuffer(nn.Module):
                     "dones": dones,
                     "truncations": truncations,
                     "observations": next_observations,
-                    "effective_n_steps": torch.ones_like(dones),
+                    "effective_n_steps": effective_n_steps,
                 },
             },
-            batch_size=batch_size,
-            device=self.device,
+            batch_size=self.n_env * batch_size,
         )
-
         if self.asymmetric_obs:
-            out["critic_observations"] = self.critic_observations[indices]
-            out["next"]["critic_observations"] = (
-                self.next_critic_observations[indices]
-            )
+            out["critic_observations"] = critic_observations
+            out["next"]["critic_observations"] = next_critic_observations
 
+        if self.n_steps > 1 and self.ptr >= self.buffer_size:
+            # Roll back the truncation flags introduced for safe sampling
+            self.truncations[:, current_pos - 1] = curr_truncations
         return out
 
 
@@ -547,7 +785,7 @@ def save_params(
             if hasattr(critic_obs_normalizer, "state_dict")
             else None
         ),
-        "args": dict(args) if isinstance(args, dict) else vars(args),  # Save all arguments
+        "args": vars(args),  # Save all arguments
         "global_step": global_step,
     }
     torch.save(save_dict, save_path, _use_new_zipfile_serialization=True)
