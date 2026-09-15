@@ -61,15 +61,33 @@ class PufferDriveEnv:
         self.num_obs = vecenv.single_observation_space.shape[0]
         self.num_actions = vecenv.single_action_space.shape[0]
         self.asymmetric_obs = False
+        self.agent_dead = torch.zeros(vecenv.num_agents, device=device, dtype=torch.bool)
+        self.pending = {}
 
     def reset(self):
-        observations, _ = self.vecenv.reset(seed=self.seed)
-        return torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
+        self.vecenv.async_reset(self.seed)
+        observations, _, _, _, _, agent_ids, _ = self.vecenv.recv()
+        self.agent_ids = agent_ids.copy()
+        self.pending.clear()
+        self.agent_dead.zero_()
+        self.observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
+        return self.observations
 
     def step(self, actions):
-        actions = torch.clamp(actions, -1.0, 1.0)
-        actions = actions.detach().float().cpu().numpy()
-        observations, rewards, terminals, truncations, infos = self.vecenv.step(actions)
+        actions = torch.clamp(actions.float(), -1.0, 1.0)
+        self.pending[int(self.agent_ids[0])] = (self.agent_ids, self.observations, actions)
+        self.vecenv.send(actions.detach().cpu().numpy())
+        observations, rewards, terminals, truncations, infos, agent_ids, masks = self.vecenv.recv()
+
+        previous = self.pending.pop(int(agent_ids[0]), None)
+        if previous is not None and not np.array_equal(previous[0], agent_ids):
+            raise RuntimeError("PufferDrive agent IDs changed within an asynchronous batch")
+        selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
+        valid = (~self.agent_dead[selected_ids]) & torch.as_tensor(
+            masks, device=self.device, dtype=torch.bool
+        )
+        if previous is None:
+            valid.zero_()
 
         raw_observations = observations.copy()
         offset = 0
@@ -100,9 +118,15 @@ class PufferDriveEnv:
         terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         dones = terminals | truncations
+        self.agent_dead[selected_ids] |= terminals & ~truncations
+        self.agent_dead[selected_ids] &= ~truncations
+        self.agent_ids = agent_ids.copy()
+        self.observations = observations
         info = {
             "time_outs": truncations,
             "observations": {"raw": {"obs": raw_observations}},
+            "transition": previous,
+            "valid": valid,
         }
         return observations, rewards, dones, info
 
@@ -554,6 +578,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         critic_obs = torch.as_tensor(critic_obs, device=device, dtype=torch.float)
     else:
         obs = envs.reset()
+    noise_scales_by_id = (
+        torch.rand(vecenv.num_agents, 1, device=device)
+        * (actor_detach.std_max - actor_detach.std_min)
+        + actor_detach.std_min
+    )
     if args.checkpoint_path:
         # Load checkpoint if specified
         torch_checkpoint = torch.load(
@@ -593,10 +622,23 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         with torch.no_grad(), autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
-            norm_obs = normalize_obs(obs)
+            current_ids = torch.as_tensor(envs.agent_ids, device=device, dtype=torch.long)
+            if args.obs_normalization:
+                active = ~envs.agent_dead[current_ids]
+                if bool(active.any()):
+                    obs_normalizer.update(obs[active])
+                norm_obs = normalize_obs(obs, update=False)
+            else:
+                norm_obs = normalize_obs(obs)
+            actor_detach.noise_scales.copy_(noise_scales_by_id[current_ids])
             actions = policy(obs=norm_obs, dones=dones)
+            noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
+        previous = infos["transition"]
+        if previous is None:
+            obs = next_obs
+            continue
         truncations = infos["time_outs"]
 
         if args.reward_normalization:
@@ -622,8 +664,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         transition = TensorDict(
             {
-                "observations": obs,
-                "actions": torch.as_tensor(actions, device=device, dtype=torch.float),
+                "observations": previous[1],
+                "actions": previous[2],
+                "valid": infos["valid"],
                 "next": {
                     "observations": true_next_obs,
                     "rewards": torch.as_tensor(

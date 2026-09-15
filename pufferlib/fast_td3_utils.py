@@ -85,6 +85,8 @@ class SimpleReplayBuffer(nn.Module):
                     (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
                 )
         self.ptr = 0
+        self.valid_counts = torch.zeros(n_env, device=device, dtype=torch.long)
+        self.masked = False
 
     @torch.no_grad()
     def extend(
@@ -97,6 +99,22 @@ class SimpleReplayBuffer(nn.Module):
         dones = tensor_dict["next"]["dones"]
         truncations = tensor_dict["next"]["truncations"]
         next_observations = tensor_dict["next"]["observations"]
+
+        if "valid" in tensor_dict:
+            if self.n_steps != 1 or self.asymmetric_obs:
+                raise NotImplementedError("Masked PufferDrive replay requires one-step, symmetric observations")
+            self.masked = True
+            rows = torch.nonzero(tensor_dict["valid"].bool(), as_tuple=True)[0]
+            slots = self.valid_counts[rows] % self.buffer_size
+            self.observations[rows, slots] = observations[rows]
+            self.actions[rows, slots] = actions[rows]
+            self.rewards[rows, slots] = rewards[rows]
+            self.dones[rows, slots] = dones[rows]
+            self.truncations[rows, slots] = truncations[rows]
+            self.next_observations[rows, slots] = next_observations[rows]
+            self.valid_counts[rows] += 1
+            self.ptr += 1
+            return
 
         ptr = self.ptr % self.buffer_size
         self.observations[:, ptr] = observations
@@ -124,6 +142,43 @@ class SimpleReplayBuffer(nn.Module):
     @torch.no_grad()
     def sample(self, batch_size: int):
         # we will sample n_env * batch_size transitions
+
+        if self.masked:
+            counts = self.valid_counts.clamp(max=self.buffer_size)
+            eligible = torch.nonzero(counts > 0, as_tuple=True)[0]
+            if eligible.numel() == 0:
+                raise RuntimeError("No valid PufferDrive transitions are available for replay")
+            rows = torch.arange(self.n_env, device=self.device)
+            if eligible.numel() != self.n_env:
+                substitutes = eligible[torch.randint(
+                    eligible.numel(), (self.n_env,), device=self.device
+                )]
+                rows = torch.where(counts > 0, rows, substitutes)
+            slots = (torch.rand(self.n_env, batch_size, device=self.device)
+                     * counts[rows, None]).long()
+            out = TensorDict(
+                {
+                    "observations": self.observations[rows[:, None], slots].reshape(
+                        self.n_env * batch_size, self.n_obs
+                    ),
+                    "actions": self.actions[rows[:, None], slots].reshape(
+                        self.n_env * batch_size, self.n_act
+                    ),
+                    "next": {
+                        "rewards": self.rewards[rows[:, None], slots].reshape(-1),
+                        "dones": self.dones[rows[:, None], slots].reshape(-1),
+                        "truncations": self.truncations[rows[:, None], slots].reshape(-1),
+                        "observations": self.next_observations[rows[:, None], slots].reshape(
+                            self.n_env * batch_size, self.n_obs
+                        ),
+                        "effective_n_steps": torch.ones(
+                            self.n_env * batch_size, device=self.device, dtype=torch.long
+                        ),
+                    },
+                },
+                batch_size=self.n_env * batch_size,
+            )
+            return out
 
         if self.n_steps == 1:
             indices = torch.randint(
