@@ -67,6 +67,7 @@ class PufferDriveEnv:
         return torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
 
     def step(self, actions):
+        actions = torch.clamp(actions, -1.0, 1.0)
         actions = actions.detach().float().cpu().numpy()
         observations, rewards, terminals, truncations, infos = self.vecenv.step(actions)
 
