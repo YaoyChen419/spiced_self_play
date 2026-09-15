@@ -1813,6 +1813,17 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
     actor_state = checkpoint["actor_state_dict"]
     n_obs = actor_state["net.0.weight"].shape[-1]
     n_act = actor_state["fc_mu.0.weight"].shape[0]
+    encoder_factory = None
+    if "encoder.ego_encoder.0.weight" in actor_state:
+        from functools import partial
+        from pufferlib.fast_td3_encoder import DriveEncoder
+
+        encoder_factory = partial(
+            DriveEncoder,
+            vecenv.driver_env,
+            input_size=actor_state["encoder.ego_encoder.0.weight"].shape[0],
+            hidden_size=actor_state["encoder.shared_embedding.1.weight"].shape[0],
+        )
 
     actor = Actor(
         n_obs=n_obs,
@@ -1826,6 +1837,7 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
         sim_dimension=checkpoint_args["sim_dimension"],
         seq_len=checkpoint_args["actor_seq_len"],
         device=device,
+        encoder_factory=encoder_factory,
     )
     actor.load_state_dict(actor_state)
     actor.eval()

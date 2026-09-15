@@ -13,6 +13,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 import random
 import time
 import math
+from functools import partial
 from types import SimpleNamespace
 
 import tqdm
@@ -90,6 +91,8 @@ class PufferDriveEnv:
             valid.zero_()
 
         raw_observations = observations.copy()
+        # Metadata preserves true terminals before map resampling marks all slots done.
+        true_terminals = terminals.copy()
         offset = 0
         transitions = []
         for info in infos:
@@ -98,6 +101,7 @@ class PufferDriveEnv:
 
         for transition in transitions:
             count = transition["count"]
+            true_terminals[offset:offset + count] = transition["terminals"]
             indices = transition["indices"] + offset
             raw_observations[indices] = transition["observations"]
             offset += count
@@ -115,15 +119,20 @@ class PufferDriveEnv:
         observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
         raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
-        terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
-        dones = terminals | truncations
-        self.agent_dead[selected_ids] |= terminals & ~truncations
+        # FastTD3 expects time_outs to exclude genuine task termination.
+        true_terminals = torch.as_tensor(true_terminals, device=self.device, dtype=torch.bool)
+        dones = true_terminals | truncations
+        time_outs = truncations & ~true_terminals
+        # Terminal next states have no continuation value. Do not feed removal
+        # sentinel coordinates to the encoder or normalizer.
+        raw_observations = torch.where(true_terminals[:, None], 0.0, raw_observations)
+        self.agent_dead[selected_ids] |= true_terminals
         self.agent_dead[selected_ids] &= ~truncations
         self.agent_ids = agent_ids.copy()
         self.observations = observations
         info = {
-            "time_outs": truncations,
+            "time_outs": time_outs,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
             "valid": valid,
@@ -199,6 +208,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     env_type = "puffer_drive"
     envs = PufferDriveEnv(vecenv, device, args.seed)
+
+    if args.obs_normalization:
+        raise ValueError(
+            "SPiCED DriveEncoder requires raw, environment-scaled observations "
+            "(including road category IDs); set obs_normalization=False."
+        )
 
     n_act = envs.num_actions
     n_obs = envs.num_obs if type(envs.num_obs) == int else envs.num_obs[0]
@@ -336,6 +351,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     else:
         raise ValueError(f"Agent {args.agent} not supported")
 
+    from pufferlib.fast_td3_encoder import DriveEncoder
+
+    encoder_factory = partial(DriveEncoder, vecenv.driver_env, **full_args["policy"])
+    actor_kwargs["encoder_factory"] = encoder_factory
+    critic_kwargs["encoder_factory"] = encoder_factory
     actor = actor_cls(**actor_kwargs)
 
     if env_type in ["mtbench"]:
@@ -691,9 +711,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if global_step > args.learning_starts:
             for i in range(args.num_updates):
                 data = rb.sample(max(1, args.batch_size // args.num_envs))
-                data["observations"] = normalize_obs(data["observations"])
+                normalize_kwargs = {"update": False} if args.obs_normalization else {}
+                data["observations"] = normalize_obs(data["observations"], **normalize_kwargs)
                 data["next"]["observations"] = normalize_obs(
-                    data["next"]["observations"]
+                    data["next"]["observations"], **normalize_kwargs
                 )
                 if envs.asymmetric_obs:
                     data["critic_observations"] = normalize_critic_obs(

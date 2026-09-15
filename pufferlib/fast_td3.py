@@ -69,8 +69,12 @@ class DistributionalQNetwork(nn.Module):
         sim_dimension: int,
         seq_len: int,
         device: torch.device = None,
+        encoder_factory=None,
     ):
         super().__init__()
+        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
+        if encoder_factory:
+            n_obs = self.encoder.hidden_size
         _validate_sim_config(sim_type, sim_dimension, seq_len)
 
         self.net = nn.Sequential(
@@ -102,7 +106,7 @@ class DistributionalQNetwork(nn.Module):
         self.num_atoms = num_atoms
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([obs, actions], 1)
+        x = torch.cat([self.encoder(obs), actions], 1)
         x = self.net(x)
         x = self.fc_head(x)
         return x
@@ -168,6 +172,7 @@ class Critic(nn.Module):
         sim_dimension: int,
         seq_len: int,
         device: torch.device = None,
+        encoder_factory=None,
     ):
         super().__init__()
         self.qnet1 = DistributionalQNetwork(
@@ -181,6 +186,7 @@ class Critic(nn.Module):
             sim_dimension=sim_dimension,
             seq_len=seq_len,
             device=device,
+            encoder_factory=encoder_factory,
         )
         self.qnet2 = DistributionalQNetwork(
             n_obs=n_obs,
@@ -193,6 +199,7 @@ class Critic(nn.Module):
             sim_dimension=sim_dimension,
             seq_len=seq_len,
             device=device,
+            encoder_factory=encoder_factory,
         )
 
         self.register_buffer(
@@ -251,8 +258,12 @@ class Actor(nn.Module):
         sim_dimension: int = 64,
         seq_len: int = 8,
         device: torch.device = None,
+        encoder_factory=None,
     ):
         super().__init__()
+        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
+        if encoder_factory:
+            n_obs = self.encoder.hidden_size
         _validate_sim_config(sim_type, sim_dimension, seq_len)
 
         self.n_act = n_act
@@ -300,7 +311,7 @@ class Actor(nn.Module):
         self.device = device
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = obs
+        x = self.encoder(obs)
         x_net = self.net(x)
         x_head = self.fc_head(x_net)
         action = self.fc_mu(x_head)
