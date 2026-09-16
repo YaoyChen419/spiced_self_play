@@ -284,7 +284,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     int init_steps = unpack(kwargs, "init_steps");
     PyObject *final_obs = PyDict_GetItemString(kwargs, "final_observations");
     if (final_obs && final_obs != Py_None) {
-        int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
+        int ego_dim = EGO_FEATURES_FOR_DYNAMICS(env->dynamics_model);
         int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
                       ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
         if (!PyArray_Check(final_obs) || PyArray_TYPE((PyArrayObject *)final_obs) != NPY_FLOAT32 ||

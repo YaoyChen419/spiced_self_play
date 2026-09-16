@@ -123,7 +123,11 @@ class Drive(pufferlib.PufferEnv):
         self.capture_final_observations = capture_final_observations
 
         # Observation space calculation
-        self.ego_features = binding.EGO_FEATURES_JERK if dynamics_model == "jerk" else binding.EGO_FEATURES
+        self.ego_features = {
+            "classic": binding.EGO_FEATURES,
+            "jerk": binding.EGO_FEATURES_JERK,
+            "delta_local": binding.EGO_FEATURES_DELTA_LOCAL,
+        }[dynamics_model]
 
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays

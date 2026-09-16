@@ -72,9 +72,6 @@ class DistributionalQNetwork(nn.Module):
         encoder_factory=None,
     ):
         super().__init__()
-        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
-        if encoder_factory:
-            n_obs = self.encoder.hidden_size
         _validate_sim_config(sim_type, sim_dimension, seq_len)
 
         self.net = nn.Sequential(
@@ -106,7 +103,7 @@ class DistributionalQNetwork(nn.Module):
         self.num_atoms = num_atoms
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([self.encoder(obs), actions], 1)
+        x = torch.cat([obs, actions], 1)
         x = self.net(x)
         x = self.fc_head(x)
         return x
@@ -175,8 +172,10 @@ class Critic(nn.Module):
         encoder_factory=None,
     ):
         super().__init__()
+        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
+        encoded_obs = self.encoder.hidden_size if encoder_factory else n_obs
         self.qnet1 = DistributionalQNetwork(
-            n_obs=n_obs,
+            n_obs=encoded_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -186,10 +185,9 @@ class Critic(nn.Module):
             sim_dimension=sim_dimension,
             seq_len=seq_len,
             device=device,
-            encoder_factory=encoder_factory,
         )
         self.qnet2 = DistributionalQNetwork(
-            n_obs=n_obs,
+            n_obs=encoded_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -199,7 +197,6 @@ class Critic(nn.Module):
             sim_dimension=sim_dimension,
             seq_len=seq_len,
             device=device,
-            encoder_factory=encoder_factory,
         )
 
         self.register_buffer(
@@ -207,8 +204,12 @@ class Critic(nn.Module):
         )
         self.device = device
 
+    def encode(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.encoder(obs)
+
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.qnet1(obs, actions), self.qnet2(obs, actions)
+        encoded_obs = self.encode(obs)
+        return self.qnet1(encoded_obs, actions), self.qnet2(encoded_obs, actions)
 
     def projection(
         self,
@@ -219,8 +220,9 @@ class Critic(nn.Module):
         discount: float,
     ) -> torch.Tensor:
         """Projection operation that includes q_support directly"""
+        encoded_obs = self.encode(obs)
         q1_proj = self.qnet1.projection(
-            obs,
+            encoded_obs,
             actions,
             rewards,
             bootstrap,
@@ -229,7 +231,7 @@ class Critic(nn.Module):
             self.q_support.device,
         )
         q2_proj = self.qnet2.projection(
-            obs,
+            encoded_obs,
             actions,
             rewards,
             bootstrap,
