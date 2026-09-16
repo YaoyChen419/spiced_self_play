@@ -13,7 +13,6 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 import random
 import time
 import math
-from functools import partial
 from types import SimpleNamespace
 
 import tqdm
@@ -65,7 +64,6 @@ class PufferDriveEnv:
         self.agent_dead = torch.zeros(vecenv.num_agents, device=device, dtype=torch.bool)
         self.pending = {}
         self.step_count = 0
-        self.delta_local = vecenv.driver_env.dynamics_model == "delta_local"
 
     def reset(self):
         self.vecenv.async_reset(self.seed)
@@ -126,16 +124,11 @@ class PufferDriveEnv:
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         self.step_count += 1
         step_metrics = {}
-        if previous is not None and self.delta_local and self.step_count % 100 == 0:
+        if previous is not None and self.step_count % 100 == 0:
             metric_mask = valid
             if bool(metric_mask.any()):
-                executed_actions = raw_observations[metric_mask, 10:13]
-                requested_actions = previous[2][metric_mask]
                 step_metrics["stopped_ratio"] = (
                     raw_observations[metric_mask, 6].abs() < 1e-3
-                ).float().mean()
-                step_metrics["action_clipped_ratio"] = (
-                    (executed_actions - requested_actions).abs().amax(dim=1) > 1e-4
                 ).float().mean()
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         # FastTD3 expects time_outs to exclude genuine task termination.
@@ -228,12 +221,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     env_type = "puffer_drive"
     envs = PufferDriveEnv(vecenv, device, args.seed)
-
-    if args.obs_normalization:
-        raise ValueError(
-            "SPiCED DriveEncoder requires raw, environment-scaled observations "
-            "(including road category IDs); set obs_normalization=False."
-        )
 
     n_act = envs.num_actions
     n_obs = envs.num_obs if type(envs.num_obs) == int else envs.num_obs[0]
@@ -371,11 +358,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     else:
         raise ValueError(f"Agent {args.agent} not supported")
 
-    from pufferlib.fast_td3_encoder import DriveEncoder
-
-    encoder_factory = partial(DriveEncoder, vecenv.driver_env, **full_args["policy"])
-    actor_kwargs["encoder_factory"] = encoder_factory
-    critic_kwargs["encoder_factory"] = encoder_factory
     actor = actor_cls(**actor_kwargs)
 
     if env_type in ["mtbench"]:
@@ -740,10 +722,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if global_step > args.learning_starts:
             for i in range(args.num_updates):
                 data = rb.sample(max(1, args.batch_size // args.num_envs))
-                normalize_kwargs = {"update": False} if args.obs_normalization else {}
-                data["observations"] = normalize_obs(data["observations"], **normalize_kwargs)
+                data["observations"] = normalize_obs(data["observations"])
                 data["next"]["observations"] = normalize_obs(
-                    data["next"]["observations"], **normalize_kwargs
+                    data["next"]["observations"]
                 )
                 if envs.asymmetric_obs:
                     data["critic_observations"] = normalize_critic_obs(

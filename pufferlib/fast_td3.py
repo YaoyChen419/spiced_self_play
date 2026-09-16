@@ -69,7 +69,6 @@ class DistributionalQNetwork(nn.Module):
         sim_dimension: int,
         seq_len: int,
         device: torch.device = None,
-        encoder_factory=None,
     ):
         super().__init__()
         _validate_sim_config(sim_type, sim_dimension, seq_len)
@@ -169,13 +168,10 @@ class Critic(nn.Module):
         sim_dimension: int,
         seq_len: int,
         device: torch.device = None,
-        encoder_factory=None,
     ):
         super().__init__()
-        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
-        encoded_obs = self.encoder.hidden_size if encoder_factory else n_obs
         self.qnet1 = DistributionalQNetwork(
-            n_obs=encoded_obs,
+            n_obs=n_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -187,7 +183,7 @@ class Critic(nn.Module):
             device=device,
         )
         self.qnet2 = DistributionalQNetwork(
-            n_obs=encoded_obs,
+            n_obs=n_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -204,12 +200,8 @@ class Critic(nn.Module):
         )
         self.device = device
 
-    def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.encoder(obs)
-
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        encoded_obs = self.encode(obs)
-        return self.qnet1(encoded_obs, actions), self.qnet2(encoded_obs, actions)
+        return self.qnet1(obs, actions), self.qnet2(obs, actions)
 
     def projection(
         self,
@@ -220,9 +212,8 @@ class Critic(nn.Module):
         discount: float,
     ) -> torch.Tensor:
         """Projection operation that includes q_support directly"""
-        encoded_obs = self.encode(obs)
         q1_proj = self.qnet1.projection(
-            encoded_obs,
+            obs,
             actions,
             rewards,
             bootstrap,
@@ -231,7 +222,7 @@ class Critic(nn.Module):
             self.q_support.device,
         )
         q2_proj = self.qnet2.projection(
-            encoded_obs,
+            obs,
             actions,
             rewards,
             bootstrap,
@@ -260,12 +251,8 @@ class Actor(nn.Module):
         sim_dimension: int = 64,
         seq_len: int = 8,
         device: torch.device = None,
-        encoder_factory=None,
     ):
         super().__init__()
-        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
-        if encoder_factory:
-            n_obs = self.encoder.hidden_size
         _validate_sim_config(sim_type, sim_dimension, seq_len)
 
         self.n_act = n_act
@@ -313,7 +300,7 @@ class Actor(nn.Module):
         self.device = device
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(obs)
+        x = obs
         x_net = self.net(x)
         x_head = self.fc_head(x_net)
         action = self.fc_mu(x_head)

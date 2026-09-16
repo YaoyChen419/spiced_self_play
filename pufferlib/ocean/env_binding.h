@@ -1083,7 +1083,11 @@ static PyObject *vec_collect_expert_data(PyObject *self, PyObject *args) {
         int num_agents = env->active_agent_count;
         int discrete_action_dim = (env->dynamics_model == DELTA_LOCAL) ? 3 : 1;
 
-        int ego_dim = EGO_FEATURES_FOR_DYNAMICS(env->dynamics_model);
+        int ego_dim;
+        if (env->dynamics_model == JERK)
+            ego_dim = EGO_FEATURES_JERK;
+        else 
+            ego_dim = EGO_FEATURES;
         int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
 
         float *env_actions_discrete =
@@ -1213,7 +1217,6 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
     PyModule_AddIntConstant(m, "EGO_FEATURES", EGO_FEATURES); // Default
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
-    PyModule_AddIntConstant(m, "EGO_FEATURES_DELTA_LOCAL", EGO_FEATURES_DELTA_LOCAL);
 
     return m;
 }
