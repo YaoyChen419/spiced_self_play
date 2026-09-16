@@ -101,17 +101,22 @@ class SimpleReplayBuffer(nn.Module):
         next_observations = tensor_dict["next"]["observations"]
 
         if "valid" in tensor_dict:
-            if self.n_steps != 1 or self.asymmetric_obs:
-                raise NotImplementedError("Masked PufferDrive replay requires one-step, symmetric observations")
+            if self.asymmetric_obs:
+                raise NotImplementedError(
+                    "Masked PufferDrive replay requires symmetric observations"
+                )
             self.masked = True
-            rows = torch.nonzero(tensor_dict["valid"].bool(), as_tuple=True)[0]
+            valid_rows = torch.nonzero(
+                tensor_dict["valid"].bool(), as_tuple=True
+            )[0]
+            rows = tensor_dict["agent_ids"][valid_rows].long()
             slots = self.valid_counts[rows] % self.buffer_size
-            self.observations[rows, slots] = observations[rows]
-            self.actions[rows, slots] = actions[rows]
-            self.rewards[rows, slots] = rewards[rows]
-            self.dones[rows, slots] = dones[rows]
-            self.truncations[rows, slots] = truncations[rows]
-            self.next_observations[rows, slots] = next_observations[rows]
+            self.observations[rows, slots] = observations[valid_rows]
+            self.actions[rows, slots] = actions[valid_rows]
+            self.rewards[rows, slots] = rewards[valid_rows]
+            self.dones[rows, slots] = dones[valid_rows]
+            self.truncations[rows, slots] = truncations[valid_rows]
+            self.next_observations[rows, slots] = next_observations[valid_rows]
             self.valid_counts[rows] += 1
             self.ptr += 1
             return
@@ -140,43 +145,81 @@ class SimpleReplayBuffer(nn.Module):
         self.ptr += 1
 
     @torch.no_grad()
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, total_batch_size: Optional[int] = None):
         # we will sample n_env * batch_size transitions
 
         if self.masked:
-            counts = self.valid_counts.clamp(max=self.buffer_size)
-            eligible = torch.nonzero(counts > 0, as_tuple=True)[0]
+            eligible = torch.nonzero(
+                self.valid_counts >= self.n_steps, as_tuple=True
+            )[0]
             if eligible.numel() == 0:
-                raise RuntimeError("No valid PufferDrive transitions are available for replay")
-            rows = torch.arange(self.n_env, device=self.device)
-            if eligible.numel() != self.n_env:
-                substitutes = eligible[torch.randint(
-                    eligible.numel(), (self.n_env,), device=self.device
-                )]
-                rows = torch.where(counts > 0, rows, substitutes)
-            slots = (torch.rand(self.n_env, batch_size, device=self.device)
-                     * counts[rows, None]).long()
+                raise RuntimeError(
+                    "No PufferDrive agents have enough transitions for n-step replay"
+                )
+
+            sample_count = total_batch_size or self.n_env * batch_size
+            rows = eligible[
+                torch.randint(
+                    eligible.numel(), (sample_count,), device=self.device
+                )
+            ]
+            counts = self.valid_counts[rows]
+            oldest = torch.clamp(counts - self.buffer_size, min=0)
+            num_starts = counts - oldest - self.n_steps + 1
+            logical_indices = oldest + (
+                torch.rand(sample_count, device=self.device) * num_starts
+            ).long()
+            indices = logical_indices % self.buffer_size
+
+            observations = self.observations[rows, indices]
+            actions = self.actions[rows, indices]
+
+            seq_offsets = torch.arange(self.n_steps, device=self.device)
+            all_indices = (
+                logical_indices[:, None] + seq_offsets[None, :]
+            ) % self.buffer_size
+            all_rewards = self.rewards[rows[:, None], all_indices]
+            all_dones = self.dones[rows[:, None], all_indices]
+            all_truncations = self.truncations[rows[:, None], all_indices]
+
+            all_dones_shifted = torch.cat(
+                [torch.zeros_like(all_dones[:, :1]), all_dones[:, :-1]], dim=1
+            )
+            done_masks = torch.cumprod(1.0 - all_dones_shifted, dim=1)
+            effective_n_steps = done_masks.sum(dim=1)
+            discounts = torch.pow(
+                self.gamma, torch.arange(self.n_steps, device=self.device)
+            )
+            rewards = (all_rewards * done_masks * discounts[None, :]).sum(dim=1)
+
+            first_done = torch.argmax((all_dones > 0).float(), dim=1)
+            first_trunc = torch.argmax((all_truncations > 0).float(), dim=1)
+            first_done = torch.where(
+                all_dones.sum(dim=1) == 0, self.n_steps - 1, first_done
+            )
+            first_trunc = torch.where(
+                all_truncations.sum(dim=1) == 0, self.n_steps - 1, first_trunc
+            )
+            final_offsets = torch.minimum(first_done, first_trunc)
+            final_indices = all_indices.gather(
+                1, final_offsets[:, None]
+            ).squeeze(1)
+
             out = TensorDict(
                 {
-                    "observations": self.observations[rows[:, None], slots].reshape(
-                        self.n_env * batch_size, self.n_obs
-                    ),
-                    "actions": self.actions[rows[:, None], slots].reshape(
-                        self.n_env * batch_size, self.n_act
-                    ),
+                    "observations": observations,
+                    "actions": actions,
                     "next": {
-                        "rewards": self.rewards[rows[:, None], slots].reshape(-1),
-                        "dones": self.dones[rows[:, None], slots].reshape(-1),
-                        "truncations": self.truncations[rows[:, None], slots].reshape(-1),
-                        "observations": self.next_observations[rows[:, None], slots].reshape(
-                            self.n_env * batch_size, self.n_obs
-                        ),
-                        "effective_n_steps": torch.ones(
-                            self.n_env * batch_size, device=self.device, dtype=torch.long
-                        ),
+                        "rewards": rewards,
+                        "dones": self.dones[rows, final_indices],
+                        "truncations": self.truncations[rows, final_indices],
+                        "observations": self.next_observations[
+                            rows, final_indices
+                        ],
+                        "effective_n_steps": effective_n_steps,
                     },
                 },
-                batch_size=self.n_env * batch_size,
+                batch_size=sample_count,
             )
             return out
 

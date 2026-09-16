@@ -146,6 +146,7 @@ class PufferDriveEnv:
             "time_outs": time_outs,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
+            "agent_ids": selected_ids,
             "valid": valid,
             "episode_logs": episode_logs,
             "step_metrics": step_metrics,
@@ -399,7 +400,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     )
 
     rb = SimpleReplayBuffer(
-        n_env=args.num_envs,
+        n_env=vecenv.num_agents,
         buffer_size=args.buffer_size,
         n_obs=n_obs,
         n_act=n_act,
@@ -697,6 +698,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             {
                 "observations": previous[1],
                 "actions": previous[2],
+                "agent_ids": infos["agent_ids"],
                 "valid": infos["valid"],
                 "next": {
                     "observations": true_next_obs,
@@ -721,7 +723,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         if global_step > args.learning_starts:
             for i in range(args.num_updates):
-                data = rb.sample(max(1, args.batch_size // args.num_envs))
+                data = rb.sample(
+                    max(1, args.batch_size // args.num_envs),
+                    total_batch_size=args.batch_size,
+                )
                 data["observations"] = normalize_obs(data["observations"])
                 data["next"]["observations"] = normalize_obs(
                     data["next"]["observations"]
