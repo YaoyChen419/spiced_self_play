@@ -63,7 +63,6 @@ class PufferDriveEnv:
         self.asymmetric_obs = False
         self.agent_dead = torch.zeros(vecenv.num_agents, device=device, dtype=torch.bool)
         self.pending = {}
-        self.step_count = 0
 
     def reset(self):
         self.vecenv.async_reset(self.seed)
@@ -94,13 +93,11 @@ class PufferDriveEnv:
         # Metadata preserves true terminals before map resampling marks all slots done.
         true_terminals = terminals.copy()
         offset = 0
-        transitions = []
-        episode_logs = []
-        for item in infos:
-            if "_fasttd3_transition" in item:
-                transitions.append(item["_fasttd3_transition"])
-            else:
-                episode_logs.append(item)
+        transitions = [
+            item["_fasttd3_transition"]
+            for item in infos
+            if "_fasttd3_transition" in item
+        ]
 
         for transition in transitions:
             count = transition["count"]
@@ -122,14 +119,6 @@ class PufferDriveEnv:
         observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
         raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
-        self.step_count += 1
-        step_metrics = {}
-        if previous is not None and self.step_count % 100 == 0:
-            metric_mask = valid
-            if bool(metric_mask.any()):
-                step_metrics["stopped_ratio"] = (
-                    raw_observations[metric_mask, 6].abs() < 1e-3
-                ).float().mean()
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         # FastTD3 expects time_outs to exclude genuine task termination.
         true_terminals = torch.as_tensor(true_terminals, device=self.device, dtype=torch.bool)
@@ -148,8 +137,6 @@ class PufferDriveEnv:
             "transition": previous,
             "agent_ids": selected_ids,
             "valid": valid,
-            "episode_logs": episode_logs,
-            "step_metrics": step_metrics,
         }
         return observations, rewards, dones, info
 
@@ -534,10 +521,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logs_dict["qf_loss"] = qf_loss.detach()
         logs_dict["qf_max"] = qf1_next_target_value.max().detach()
         logs_dict["qf_min"] = qf1_next_target_value.min().detach()
-        logs_dict["q_boundary_mass"] = 0.5 * (
-            (qf1_next_target_dist[:, 0] + qf1_next_target_dist[:, -1]).mean()
-            + (qf2_next_target_dist[:, 0] + qf2_next_target_dist[:, -1]).mean()
-        ).detach()
         return logs_dict
 
     def update_pol(data, logs_dict):
@@ -631,8 +614,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     start_time = None
     desc = ""
     all_logs = []
-    latest_episode_logs = {}
-    latest_step_metrics = {}
     model_dir = os.path.join(args.data_dir, f"{env_name}_{logger.run_id}")
 
     def checkpoint_path(step):
@@ -664,9 +645,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
-        for episode_log in infos["episode_logs"]:
-            latest_episode_logs.update(episode_log)
-        latest_step_metrics.update(infos["step_metrics"])
         previous = infos["transition"]
         if previous is None:
             obs = next_obs
@@ -768,27 +746,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         "qf_loss": logs_dict["qf_loss"].mean(),
                         "qf_max": logs_dict["qf_max"].mean(),
                         "qf_min": logs_dict["qf_min"].mean(),
-                        "q_boundary_mass": logs_dict["q_boundary_mass"].mean(),
                         "actor_grad_norm": logs_dict["actor_grad_norm"].mean(),
                         "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
                         "env_rewards": rewards.mean(),
                         "buffer_rewards": raw_rewards.mean(),
-                        "buffer_positive_reward_ratio": (raw_rewards > 0).float().mean(),
-                        **latest_step_metrics,
                     }
-                    episode_metric_names = (
-                        "episode_return",
-                        "route_progress",
-                        "collision_rate",
-                        "offroad_rate",
-                    )
-                    logs.update({
-                        name: latest_episode_logs[name]
-                        for name in episode_metric_names
-                        if name in latest_episode_logs
-                    })
-                    if "completion_rate" in latest_episode_logs:
-                        logs["goal_rate"] = latest_episode_logs["completion_rate"]
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                         print(f"Evaluating at global step {global_step}")
@@ -801,7 +763,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     "actor_lr": actor_scheduler.get_last_lr()[0],
                     **logs,
                 }
-                logger.log(logs, step=global_step * args.num_envs)
+                logger.log(logs, step=global_step)
                 all_logs.append(logs)
 
             if (
