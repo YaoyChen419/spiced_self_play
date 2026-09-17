@@ -215,6 +215,21 @@ class WOSACEvaluator:
             obs, info = puffer_env.reset()
             truncations = np.zeros((num_agents,), dtype=bool)
             state = {}
+            recurrent_fasttd3 = (
+                policy is not None
+                and obs_normalizer is not None
+                and hasattr(policy, "recurrent_step")
+            )
+
+            if recurrent_fasttd3:
+                state = policy.history.initial_state(num_agents, device)
+                previous_actions = torch.zeros(
+                    num_agents, policy.n_act, device=device
+                )
+                previous_rewards = torch.zeros(num_agents, 1, device=device)
+                recurrent_dones = torch.zeros(
+                    num_agents, dtype=torch.bool, device=device
+                )
 
             if (
                 args["train"]["use_rnn"]
@@ -267,7 +282,32 @@ class WOSACEvaluator:
                                         ob_tensor,
                                         update=False,
                                     )
-                                action = policy(normalized_obs)
+                                if recurrent_fasttd3:
+                                    done_indices = recurrent_dones.nonzero(
+                                        as_tuple=True
+                                    )[0]
+                                    state[0][:, done_indices] = 0
+                                    state[1][:, done_indices] = 0
+                                    previous_actions[done_indices] = 0
+                                    previous_rewards[done_indices] = 0
+                                    action, state = policy.recurrent_step(
+                                        normalized_obs,
+                                        previous_actions,
+                                        previous_rewards,
+                                        state,
+                                    )
+                                    action = action.clamp(-1.0, 1.0)
+                                    previous_actions.copy_(action)
+                                    if args["train"]["residual_action"]:
+                                        env_action = action.clone()
+                                        env_action[:, 0] = torch.clamp(
+                                            ob_tensor[:, 10] + action[:, 0],
+                                            -1.0,
+                                            1.0,
+                                        )
+                                        action = env_action
+                                else:
+                                    action = policy(normalized_obs)
                             else:
                                 logits, value = policy.forward_eval(ob_tensor, state)
                                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
@@ -277,6 +317,21 @@ class WOSACEvaluator:
                             action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
                 obs, rewards, terminals, truncations, infos = puffer_env.step(action_np)
+                if recurrent_fasttd3:
+                    previous_rewards.copy_(
+                        torch.as_tensor(
+                            rewards,
+                            dtype=torch.float,
+                            device=device,
+                        ).unsqueeze(-1)
+                    )
+                    recurrent_dones.copy_(
+                        torch.as_tensor(
+                            terminals | truncations,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    )
 
         return trajectories
 

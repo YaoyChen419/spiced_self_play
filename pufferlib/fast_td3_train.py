@@ -54,10 +54,11 @@ except ImportError:
 class PufferDriveEnv:
     """Expose SPiCED's PufferLib vector API through FastTD3's env contract."""
 
-    def __init__(self, vecenv, device, seed):
+    def __init__(self, vecenv, device, seed, residual_action=False):
         self.vecenv = vecenv
         self.device = device
         self.seed = seed
+        self.residual_action = residual_action
         self.num_envs = vecenv.observation_space.shape[0]
         self.num_obs = vecenv.single_observation_space.shape[0]
         self.num_actions = vecenv.single_action_space.shape[0]
@@ -77,7 +78,15 @@ class PufferDriveEnv:
     def step(self, actions):
         actions = torch.clamp(actions.float(), -1.0, 1.0)
         self.pending[int(self.agent_ids[0])] = (self.agent_ids, self.observations, actions)
-        self.vecenv.send(actions.detach().cpu().numpy())
+        env_actions = actions
+        if self.residual_action:
+            env_actions = actions.clone()
+            # Residual Policy Learning: zero longitudinal residual preserves
+            # the previously executed delta-local forward motion.
+            env_actions[:, 0] = torch.clamp(
+                self.observations[:, 10] + actions[:, 0], -1.0, 1.0
+            )
+        self.vecenv.send(env_actions.detach().cpu().numpy())
         observations, rewards, terminals, truncations, infos, agent_ids, masks = self.vecenv.recv()
 
         previous = self.pending.pop(int(agent_ids[0]), None)
@@ -209,7 +218,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     print(f"Using device: {device}")
 
     env_type = "puffer_drive"
-    envs = PufferDriveEnv(vecenv, device, args.seed)
+    envs = PufferDriveEnv(
+        vecenv, device, args.seed, residual_action=args.residual_action
+    )
 
     n_act = envs.num_actions
     n_obs = envs.num_obs if type(envs.num_obs) == int else envs.num_obs[0]
@@ -288,6 +299,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
             actor_cls = MultiTaskActor
             critic_cls = MultiTaskCritic
+        elif args.recurrent:
+            from pufferlib.fast_td3_recurrent import (
+                RecurrentActor,
+                RecurrentCritic,
+            )
+
+            actor_cls = RecurrentActor
+            critic_cls = RecurrentCritic
         else:
             from pufferlib.fast_td3 import Actor, Critic
 
@@ -315,6 +334,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         )
         actor_kwargs["encoder_factory"] = encoder_factory
         critic_kwargs["encoder_factory"] = encoder_factory
+
+        if args.recurrent:
+            recurrent_kwargs = {
+                "rnn_hidden_size": full_args["rnn"]["hidden_size"],
+                "action_embedding_size": full_args["rnn"]["action_embedding_size"],
+                "reward_embedding_size": full_args["rnn"]["reward_embedding_size"],
+            }
+            actor_kwargs.update(recurrent_kwargs)
+            critic_kwargs.update(recurrent_kwargs)
 
         print("Using FastTD3")
     elif args.agent == "fasttd3_simbav2":
@@ -370,7 +398,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         actor_detach = actor_cls(**actor_kwargs)
         # Copy params to actor_detach without grad
         from_module(actor).data.to_module(actor_detach)
-        policy = actor_detach.explore
+        policy = (
+            actor_detach.explore_step
+            if args.recurrent
+            else actor_detach.explore
+        )
 
     qnet = critic_cls(**critic_kwargs)
     qnet_target = critic_cls(**critic_kwargs)
@@ -571,6 +603,131 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logs_dict["actor_loss"] = actor_loss.detach()
         return logs_dict
 
+    def update_main_recurrent(data, logs_dict):
+        with autocast(
+            device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+        ):
+            observations = data["observations"]
+            next_observations = data["next"]["observations"]
+            actions = data["actions"]
+            rewards = data["next"]["rewards"]
+            dones = data["next"]["dones"].bool()
+            truncations = data["next"]["truncations"].bool()
+            masks = data["mask"].float()
+            num_valid = masks.sum().clamp(min=1.0)
+
+            observs = torch.cat((observations[:1], next_observations), dim=0)
+            prev_actions = torch.cat((torch.zeros_like(actions[:1]), actions), dim=0)
+            prev_rewards = torch.cat((torch.zeros_like(rewards[:1]), rewards), dim=0)
+
+            if args.disable_bootstrap:
+                bootstrap = (~dones).float()
+            else:
+                bootstrap = (truncations | ~dones).float()
+            discount = torch.full_like(rewards, args.gamma)
+
+            with torch.no_grad():
+                next_actions = actor.forward_sequence(
+                    prev_actions, prev_rewards, observs
+                )[1:]
+                clipped_noise = torch.randn_like(next_actions)
+                clipped_noise = clipped_noise.mul(policy_noise).clamp(
+                    -noise_clip, noise_clip
+                )
+                next_actions = (next_actions + clipped_noise).clamp(
+                    action_low, action_high
+                )
+                qf1_target, qf2_target = qnet_target.projection_sequence(
+                    prev_actions,
+                    prev_rewards,
+                    observs,
+                    next_actions,
+                    rewards,
+                    bootstrap,
+                    discount,
+                )
+                qf1_target_value = qnet_target.get_value(qf1_target)
+                qf2_target_value = qnet_target.get_value(qf2_target)
+                if args.use_cdq:
+                    choose_q1 = qf1_target_value.unsqueeze(-1) < qf2_target_value.unsqueeze(-1)
+                    target_dist = torch.where(choose_q1, qf1_target, qf2_target)
+                    qf1_target = qf2_target = target_dist
+
+            qf1, qf2 = qnet.forward_sequence(
+                prev_actions, prev_rewards, observs, actions
+            )
+            qf1_loss = -torch.sum(
+                qf1_target * F.log_softmax(qf1, dim=-1), dim=-1, keepdim=True
+            )
+            qf2_loss = -torch.sum(
+                qf2_target * F.log_softmax(qf2, dim=-1), dim=-1, keepdim=True
+            )
+            qf_loss = ((qf1_loss + qf2_loss) * masks).sum() / num_valid
+
+        q_optimizer.zero_grad(set_to_none=True)
+        scaler.scale(qf_loss).backward()
+        scaler.unscale_(q_optimizer)
+        if args.use_grad_norm_clipping:
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                qnet.parameters(),
+                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
+            )
+        else:
+            critic_grad_norm = torch.tensor(0.0, device=device)
+        scaler.step(q_optimizer)
+        scaler.update()
+
+        valid = masks.squeeze(-1).bool()
+        logs_dict["critic_grad_norm"] = critic_grad_norm.detach()
+        logs_dict["qf_loss"] = qf_loss.detach()
+        logs_dict["qf_max"] = qf1_target_value.masked_fill(~valid, -torch.inf).max().detach()
+        logs_dict["qf_min"] = qf1_target_value.masked_fill(~valid, torch.inf).min().detach()
+        return logs_dict
+
+    def update_pol_recurrent(data, logs_dict):
+        with autocast(
+            device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+        ):
+            observations = data["observations"]
+            next_observations = data["next"]["observations"]
+            actions = data["actions"]
+            rewards = data["next"]["rewards"]
+            masks = data["mask"].float()
+            num_valid = masks.sum().clamp(min=1.0)
+
+            observs = torch.cat((observations[:1], next_observations), dim=0)
+            prev_actions = torch.cat((torch.zeros_like(actions[:1]), actions), dim=0)
+            prev_rewards = torch.cat((torch.zeros_like(rewards[:1]), rewards), dim=0)
+            policy_actions = actor.forward_sequence(
+                prev_actions, prev_rewards, observs
+            )[:-1]
+            qf1, qf2 = qnet.forward_sequence(
+                prev_actions, prev_rewards, observs, policy_actions
+            )
+            qf1_value = qnet.get_value(F.softmax(qf1, dim=-1))
+            qf2_value = qnet.get_value(F.softmax(qf2, dim=-1))
+            if args.use_cdq:
+                qf_value = torch.minimum(qf1_value, qf2_value)
+            else:
+                qf_value = (qf1_value + qf2_value) / 2.0
+            actor_loss = -(qf_value.unsqueeze(-1) * masks).sum() / num_valid
+
+        actor_optimizer.zero_grad(set_to_none=True)
+        scaler.scale(actor_loss).backward()
+        scaler.unscale_(actor_optimizer)
+        if args.use_grad_norm_clipping:
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                actor.parameters(),
+                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
+            )
+        else:
+            actor_grad_norm = torch.tensor(0.0, device=device)
+        scaler.step(actor_optimizer)
+        scaler.update()
+        logs_dict["actor_grad_norm"] = actor_grad_norm.detach()
+        logs_dict["actor_loss"] = actor_loss.detach()
+        return logs_dict
+
     @torch.no_grad()
     def soft_update(src, tgt, tau: float):
         src_ps = [p.data for p in src.parameters()]
@@ -578,6 +735,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         torch._foreach_mul_(tgt_ps, 1.0 - tau)
         torch._foreach_add_(tgt_ps, src_ps, alpha=tau)
+
+    if args.recurrent:
+        update_main = update_main_recurrent
+        update_pol = update_pol_recurrent
 
     if args.compile:
         compile_mode = args.compile_mode
@@ -606,6 +767,16 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         * (actor_detach.std_max - actor_detach.std_min)
         + actor_detach.std_min
     )
+    if args.recurrent:
+        recurrent_state_by_id = actor_detach.history.initial_state(
+            vecenv.num_agents, device
+        )
+        previous_actions_by_id = torch.zeros(
+            vecenv.num_agents, n_act, device=device
+        )
+        previous_rewards_by_id = torch.zeros(
+            vecenv.num_agents, 1, device=device
+        )
     if args.checkpoint_path:
         # Load checkpoint if specified
         torch_checkpoint = torch.load(
@@ -654,10 +825,38 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             else:
                 norm_obs = normalize_obs(obs)
             actor_detach.noise_scales.copy_(noise_scales_by_id[current_ids])
-            actions = policy(obs=norm_obs, dones=dones)
+            if args.recurrent:
+                current_dones = (
+                    torch.zeros(len(current_ids), device=device, dtype=torch.bool)
+                    if dones is None
+                    else dones.bool()
+                )
+                done_ids = current_ids[current_dones]
+                recurrent_state_by_id[0][:, done_ids] = 0
+                recurrent_state_by_id[1][:, done_ids] = 0
+                previous_actions_by_id[done_ids] = 0
+                previous_rewards_by_id[done_ids] = 0
+                actions, recurrent_state = policy(
+                    observations=norm_obs,
+                    prev_actions=previous_actions_by_id[current_ids],
+                    rewards=previous_rewards_by_id[current_ids],
+                    state=(
+                        recurrent_state_by_id[0][:, current_ids],
+                        recurrent_state_by_id[1][:, current_ids],
+                    ),
+                    dones=current_dones,
+                )
+                actions = actions.clamp(action_low, action_high)
+                recurrent_state_by_id[0][:, current_ids] = recurrent_state[0]
+                recurrent_state_by_id[1][:, current_ids] = recurrent_state[1]
+                previous_actions_by_id[current_ids] = actions
+            else:
+                actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
+        if args.recurrent:
+            previous_rewards_by_id[infos["agent_ids"]] = rewards.unsqueeze(-1)
         previous = infos["transition"]
         if previous is None:
             obs = next_obs
@@ -714,10 +913,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         if global_step > args.learning_starts:
             for i in range(args.num_updates):
-                data = rb.sample(
-                    max(1, args.batch_size // args.num_envs),
-                    total_batch_size=args.batch_size,
-                )
+                if args.recurrent:
+                    sequence_length = full_args["rnn"]["sequence_length"]
+                    data = rb.sample_sequences(
+                        max(1, args.batch_size // sequence_length),
+                        sequence_length,
+                    )
+                else:
+                    data = rb.sample(
+                        max(1, args.batch_size // args.num_envs),
+                        total_batch_size=args.batch_size,
+                    )
                 data["observations"] = normalize_obs(data["observations"])
                 data["next"]["observations"] = normalize_obs(
                     data["next"]["observations"]

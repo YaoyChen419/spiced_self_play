@@ -496,6 +496,63 @@ class SimpleReplayBuffer(nn.Module):
             self.truncations[:, current_pos - 1] = curr_truncations
         return out
 
+    @torch.no_grad()
+    def sample_sequences(self, batch_size: int, sequence_length: int):
+        """Sample contiguous per-agent sequences with episode masks.
+
+        This follows the sequence layout used by pomdp-baselines: tensors are
+        returned as (time, batch, feature), and transitions after the first
+        terminal or truncation are masked out.
+        """
+        if not self.masked:
+            raise RuntimeError("Sequence sampling requires agent-indexed replay")
+
+        eligible = torch.nonzero(
+            self.valid_counts >= sequence_length, as_tuple=True
+        )[0]
+        if eligible.numel() == 0:
+            raise RuntimeError("No agents have enough transitions for sequence replay")
+
+        rows = eligible[
+            torch.randint(eligible.numel(), (batch_size,), device=self.device)
+        ]
+        counts = self.valid_counts[rows]
+        oldest = torch.clamp(counts - self.buffer_size, min=0)
+        num_starts = counts - oldest - sequence_length + 1
+        starts = oldest + (
+            torch.rand(batch_size, device=self.device) * num_starts
+        ).long()
+        logical_indices = starts[:, None] + torch.arange(
+            sequence_length, device=self.device
+        )[None, :]
+        indices = logical_indices % self.buffer_size
+        row_indices = rows[:, None]
+
+        observations = self.observations[row_indices, indices]
+        actions = self.actions[row_indices, indices]
+        rewards = self.rewards[row_indices, indices]
+        dones = self.dones[row_indices, indices]
+        truncations = self.truncations[row_indices, indices]
+        next_observations = self.next_observations[row_indices, indices]
+
+        boundaries = (dones.bool() | truncations.bool()).float()
+        shifted_boundaries = torch.cat(
+            (torch.zeros_like(boundaries[:, :1]), boundaries[:, :-1]), dim=1
+        )
+        masks = torch.cumprod(1.0 - shifted_boundaries, dim=1)
+
+        return {
+            "observations": observations.transpose(0, 1),
+            "actions": actions.transpose(0, 1),
+            "next": {
+                "observations": next_observations.transpose(0, 1),
+                "rewards": rewards.transpose(0, 1).unsqueeze(-1),
+                "dones": dones.transpose(0, 1).unsqueeze(-1),
+                "truncations": truncations.transpose(0, 1).unsqueeze(-1),
+            },
+            "mask": masks.transpose(0, 1).unsqueeze(-1),
+        }
+
 
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
