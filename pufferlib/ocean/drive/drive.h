@@ -297,6 +297,7 @@ struct Entity {
     float init_heading_x; // Heading at episode start
     float init_heading_y;
     float init_dist_to_goal; // Distance to goal at episode start (for progress normalization)
+    float pbrs_potential;
     int offroad_state;
     float x;
     float y;
@@ -567,6 +568,8 @@ struct Drive {
     float reward_goal;
     float reward_vehicle_collision;
     float reward_offroad_collision;
+    float pbrs_scale;
+    float pbrs_gamma;
     int fix_lambdas;
     float lambda_value;
     float goal_radius;
@@ -2478,6 +2481,7 @@ void c_reset(Drive *env) {
         env->entities[agent_idx].init_dist_to_goal =
             relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y,
                                  env->entities[agent_idx].goal_position_x, env->entities[agent_idx].goal_position_y);
+        env->entities[agent_idx].pbrs_potential = 0.0f;
         // Also snapshot start position/heading (set_start_position already ran, but
         // reset clears logs after set_start_position, so capture here too)
         env->entities[agent_idx].init_x = env->entities[agent_idx].x;
@@ -2726,6 +2730,7 @@ void c_step(Drive *env) {
         // Reward agent if it is within X meters of goal and speed is below threshold
         bool within_distance = distance_to_goal < env->goal_radius;
         bool within_speed = current_speed <= env->goal_speed;
+        bool goal_reached_this_step = false;
 
         if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
             float r_goal = env->entities[agent_idx].reward_goal_cond;
@@ -2734,11 +2739,33 @@ void c_step(Drive *env) {
             env->entities[agent_idx].goals_reached_this_episode += 1.0f;
             env->entities[agent_idx].current_goal_reached = 1;
             env->logs[i].speed_at_goal = current_speed;
+            goal_reached_this_step = true;
 
             if (env->goal_behavior == GOAL_GENERATE_NEW) {
                 sample_new_goal(env, agent_idx);
                 env->entities[agent_idx].current_goal_reached = 0;
+                env->entities[agent_idx].init_dist_to_goal =
+                    relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y,
+                                         env->entities[agent_idx].goal_position_x,
+                                         env->entities[agent_idx].goal_position_y);
             }
+        }
+
+        if (env->pbrs_scale != 0.0f) {
+            bool episode_ends = goal_reached_this_step && env->goal_behavior != GOAL_GENERATE_NEW;
+            episode_ends = episode_ends || (env->timestep + 1 >= env->episode_length);
+            float next_potential = 0.0f;
+            if (!episode_ends && !goal_reached_this_step) {
+                float initial_distance = fmaxf(env->entities[agent_idx].init_dist_to_goal, 1e-6f);
+                next_potential = 1.0f - distance_to_goal / initial_distance;
+                next_potential = fminf(1.0f, fmaxf(0.0f, next_potential));
+            }
+            float shaping_reward = env->pbrs_scale *
+                                   (env->pbrs_gamma * next_potential -
+                                    env->entities[agent_idx].pbrs_potential);
+            env->rewards[i] += shaping_reward;
+            env->logs[i].episode_return += shaping_reward;
+            env->entities[agent_idx].pbrs_potential = next_potential;
         }
 
         // Per-step metrics accumulation (only while agent is alive)

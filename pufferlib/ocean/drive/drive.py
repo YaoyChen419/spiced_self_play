@@ -51,6 +51,8 @@ class Drive(pufferlib.PufferEnv):
         reward_vehicle_collision=-0.5,
         reward_offroad_collision=-0.5,
         reward_goal=1.0,
+        pbrs_scale=0.0,
+        pbrs_gamma=0.99,
         goal_behavior=0,
         goal_target_distance=10.0,
         goal_radius=2.0,
@@ -96,6 +98,8 @@ class Drive(pufferlib.PufferEnv):
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
+        self.pbrs_scale = pbrs_scale
+        self.pbrs_gamma = pbrs_gamma
         self.goal_radius = goal_radius
         self.goal_speed = goal_speed
         self.goal_behavior = goal_behavior
@@ -281,6 +285,8 @@ class Drive(pufferlib.PufferEnv):
                 reward_vehicle_collision=reward_vehicle_collision,
                 reward_offroad_collision=reward_offroad_collision,
                 reward_goal=reward_goal,
+                pbrs_scale=pbrs_scale,
+                pbrs_gamma=pbrs_gamma,
                 obs_partner_noise_pos=self.obs_partner_noise_pos,
                 obs_partner_noise_speed=self.obs_partner_noise_speed,
                 goal_radius=goal_radius,
@@ -380,6 +386,8 @@ class Drive(pufferlib.PufferEnv):
                 reward_vehicle_collision=self.reward_vehicle_collision,
                 reward_offroad_collision=self.reward_offroad_collision,
                 reward_goal=self.reward_goal,
+                pbrs_scale=self.pbrs_scale,
+                pbrs_gamma=self.pbrs_gamma,
                 goal_radius=self.goal_radius,
                 goal_behavior=self.goal_behavior,
                 goal_target_distance=self.goal_target_distance,

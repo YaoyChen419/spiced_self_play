@@ -60,6 +60,8 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
         .reward_vehicle_collision = conf.reward_vehicle_collision,
         .reward_offroad_collision = conf.reward_offroad_collision,
         .reward_goal = conf.reward_goal,
+        .pbrs_scale = conf.pbrs_scale,
+        .pbrs_gamma = conf.pbrs_gamma,
         .goal_radius = conf.goal_radius,
         .goal_behavior = conf.goal_behavior,
         .goal_target_distance = conf.goal_target_distance,
