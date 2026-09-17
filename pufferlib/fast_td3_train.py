@@ -13,6 +13,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 import random
 import time
 import math
+from functools import partial
 from types import SimpleNamespace
 
 import tqdm
@@ -223,6 +224,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     action_low, action_high = -1.0, 1.0
 
     if args.obs_normalization:
+        raise ValueError(
+            "DriveEncoder needs raw observations because road category IDs are categorical"
+        )
+
+    if args.obs_normalization:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
         critic_obs_normalizer = EmpiricalNormalization(
             shape=n_critic_obs, device=device
@@ -302,6 +308,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 "seq_len": args.critic_seq_len,
             }
         )
+
+        from pufferlib.fast_td3_encoder import DriveEncoder
+        encoder_factory = partial(
+            DriveEncoder, vecenv.driver_env, **full_args["policy"]
+        )
+        actor_kwargs["encoder_factory"] = encoder_factory
+        critic_kwargs["encoder_factory"] = encoder_factory
 
         print("Using FastTD3")
     elif args.agent == "fasttd3_simbav2":

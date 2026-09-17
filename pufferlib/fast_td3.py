@@ -168,10 +168,13 @@ class Critic(nn.Module):
         sim_dimension: int,
         seq_len: int,
         device: torch.device = None,
+        encoder_factory=None,
     ):
         super().__init__()
+        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
+        encoded_obs = self.encoder.hidden_size if encoder_factory else n_obs
         self.qnet1 = DistributionalQNetwork(
-            n_obs=n_obs,
+            n_obs=encoded_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -183,7 +186,7 @@ class Critic(nn.Module):
             device=device,
         )
         self.qnet2 = DistributionalQNetwork(
-            n_obs=n_obs,
+            n_obs=encoded_obs,
             n_act=n_act,
             num_atoms=num_atoms,
             v_min=v_min,
@@ -201,6 +204,7 @@ class Critic(nn.Module):
         self.device = device
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        obs = self.encoder(obs)
         return self.qnet1(obs, actions), self.qnet2(obs, actions)
 
     def projection(
@@ -212,6 +216,7 @@ class Critic(nn.Module):
         discount: float,
     ) -> torch.Tensor:
         """Projection operation that includes q_support directly"""
+        obs = self.encoder(obs)
         q1_proj = self.qnet1.projection(
             obs,
             actions,
@@ -251,13 +256,16 @@ class Actor(nn.Module):
         sim_dimension: int = 64,
         seq_len: int = 8,
         device: torch.device = None,
+        encoder_factory=None,
     ):
         super().__init__()
         _validate_sim_config(sim_type, sim_dimension, seq_len)
 
+        self.encoder = encoder_factory().to(device) if encoder_factory else nn.Identity()
+        encoded_obs = self.encoder.hidden_size if encoder_factory else n_obs
         self.n_act = n_act
         self.net = nn.Sequential(
-            nn.Linear(n_obs, hidden_dim, device=device),
+            nn.Linear(encoded_obs, hidden_dim, device=device),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2, device=device),
             nn.ReLU(),
@@ -300,7 +308,7 @@ class Actor(nn.Module):
         self.device = device
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = obs
+        x = self.encoder(obs)
         x_net = self.net(x)
         x_head = self.fc_head(x_net)
         action = self.fc_mu(x_head)
