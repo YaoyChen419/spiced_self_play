@@ -868,10 +868,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 recurrent_state_by_id[1][:, current_ids] = recurrent_state[1]
             else:
                 actions = policy(obs=norm_obs, dones=dones)
-            if global_step <= args.learning_starts:
-                actions = torch.rand_like(actions).mul(
-                    action_high - action_low
-                ).add(action_low)
             actions = actions.clamp(action_low, action_high)
             if args.recurrent:
                 previous_actions_by_id[current_ids] = actions.to(
