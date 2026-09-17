@@ -768,7 +768,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         + actor_detach.std_min
     )
     if args.recurrent:
-        recurrent_state_by_id = actor_detach.history.initial_state(
+        recurrent_state_by_id = actor_detach.initial_state(
             vecenv.num_agents, device
         )
         previous_actions_by_id = torch.zeros(
@@ -855,12 +855,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
-        if args.recurrent:
-            previous_rewards_by_id[infos["agent_ids"]] = rewards.unsqueeze(-1)
         previous = infos["transition"]
         if previous is None:
             obs = next_obs
             continue
+        if args.recurrent:
+            valid = infos["valid"]
+            previous_rewards_by_id[infos["agent_ids"][valid]] = rewards[
+                valid
+            ].unsqueeze(-1)
         truncations = infos["time_outs"]
 
         if args.reward_normalization:
@@ -916,7 +919,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 if args.recurrent:
                     sequence_length = full_args["rnn"]["sequence_length"]
                     data = rb.sample_sequences(
-                        max(1, args.batch_size // sequence_length),
+                        full_args["rnn"]["sequence_batch_size"],
                         sequence_length,
                     )
                 else:

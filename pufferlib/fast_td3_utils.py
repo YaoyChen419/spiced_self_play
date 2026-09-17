@@ -86,6 +86,8 @@ class SimpleReplayBuffer(nn.Module):
                 )
         self.ptr = 0
         self.valid_counts = torch.zeros(n_env, device=device, dtype=torch.long)
+        self.current_episode_steps = None
+        self.episode_steps = None
         self.masked = False
 
     @torch.no_grad()
@@ -106,6 +108,15 @@ class SimpleReplayBuffer(nn.Module):
                     "Masked PufferDrive replay requires symmetric observations"
                 )
             self.masked = True
+            if self.episode_steps is None:
+                self.current_episode_steps = torch.zeros(
+                    self.n_env, device=self.device, dtype=torch.long
+                )
+                self.episode_steps = torch.zeros(
+                    (self.n_env, self.buffer_size),
+                    device=self.device,
+                    dtype=torch.long,
+                )
             valid_rows = torch.nonzero(
                 tensor_dict["valid"].bool(), as_tuple=True
             )[0]
@@ -117,6 +128,24 @@ class SimpleReplayBuffer(nn.Module):
             self.dones[rows, slots] = dones[valid_rows]
             self.truncations[rows, slots] = truncations[valid_rows]
             self.next_observations[rows, slots] = next_observations[valid_rows]
+            episode_steps = self.current_episode_steps[rows]
+            self.episode_steps[rows, slots] = episode_steps
+            episode_ends = (
+                dones[valid_rows].bool() | truncations[valid_rows].bool()
+            )
+            self.current_episode_steps[rows] = torch.where(
+                episode_ends,
+                torch.zeros_like(episode_steps),
+                episode_steps + 1,
+            )
+            invalid_episode_ends = (
+                ~tensor_dict["valid"].bool()
+                & (dones.bool() | truncations.bool())
+            )
+            invalid_end_ids = tensor_dict["agent_ids"][
+                invalid_episode_ends
+            ].long()
+            self.current_episode_steps[invalid_end_ids] = 0
             self.valid_counts[rows] += 1
             self.ptr += 1
             return
@@ -513,15 +542,60 @@ class SimpleReplayBuffer(nn.Module):
         if eligible.numel() == 0:
             raise RuntimeError("No agents have enough transitions for sequence replay")
 
-        rows = eligible[
-            torch.randint(eligible.numel(), (batch_size,), device=self.device)
-        ]
-        counts = self.valid_counts[rows]
-        oldest = torch.clamp(counts - self.buffer_size, min=0)
-        num_starts = counts - oldest - sequence_length + 1
-        starts = oldest + (
-            torch.rand(batch_size, device=self.device) * num_starts
-        ).long()
+        # Match pomdp-baselines valid-start rule: a sampled window either stays
+        # inside one episode, or starts at the beginning of a short episode.
+        sampled_rows = []
+        sampled_starts = []
+        remaining = batch_size
+        for _ in range(16):
+            candidate_count = max(64, 2 * remaining)
+            candidate_rows = eligible[
+                torch.randint(
+                    eligible.numel(),
+                    (candidate_count,),
+                    device=self.device,
+                )
+            ]
+            counts = self.valid_counts[candidate_rows]
+            oldest = torch.clamp(counts - self.buffer_size, min=0)
+            num_starts = counts - oldest - sequence_length + 1
+            candidate_starts = oldest + (
+                torch.rand(candidate_count, device=self.device) * num_starts
+            ).long()
+            candidate_indices = (
+                candidate_starts[:, None]
+                + torch.arange(sequence_length, device=self.device)[None, :]
+            ) % self.buffer_size
+            candidate_boundaries = (
+                self.dones[candidate_rows[:, None], candidate_indices].bool()
+                | self.truncations[
+                    candidate_rows[:, None], candidate_indices
+                ].bool()
+            )
+            starts_at_episode = (
+                self.episode_steps[
+                    candidate_rows,
+                    candidate_starts % self.buffer_size,
+                ]
+                == 0
+            )
+            valid_starts = (
+                ~candidate_boundaries[:, :-1].any(dim=1)
+                | starts_at_episode
+            )
+            sampled_rows.append(candidate_rows[valid_starts][:remaining])
+            sampled_starts.append(
+                candidate_starts[valid_starts][:remaining]
+            )
+            remaining -= sampled_rows[-1].numel()
+            if remaining == 0:
+                break
+
+        if remaining:
+            raise RuntimeError("Unable to sample enough valid recurrent starts")
+
+        rows = torch.cat(sampled_rows)
+        starts = torch.cat(sampled_starts)
         logical_indices = starts[:, None] + torch.arange(
             sequence_length, device=self.device
         )[None, :]

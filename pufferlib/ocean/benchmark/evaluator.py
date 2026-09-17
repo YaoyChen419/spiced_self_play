@@ -222,7 +222,7 @@ class WOSACEvaluator:
             )
 
             if recurrent_fasttd3:
-                state = policy.history.initial_state(num_agents, device)
+                state = policy.initial_state(num_agents, device)
                 previous_actions = torch.zeros(
                     num_agents, policy.n_act, device=device
                 )
