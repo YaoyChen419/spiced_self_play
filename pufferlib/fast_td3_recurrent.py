@@ -158,9 +158,18 @@ class RecurrentActor(nn.Module):
         actions = self.fc_mu(self.fc_head(self.net(joint_embeds)))
         return actions.reshape(*shape, self.n_act)
 
-    def forward_sequence(self, prev_actions, rewards, observations):
+    def forward_sequence(
+        self,
+        prev_actions,
+        rewards,
+        observations,
+        initial_internal_state=None,
+    ):
         hidden_states, encoded_observations, _ = self.get_hidden_states(
-            prev_actions, rewards, observations
+            prev_actions,
+            rewards,
+            observations,
+            initial_internal_state,
         )
         return self._decode(hidden_states, encoded_observations)
 
@@ -295,7 +304,13 @@ class RecurrentCritic(nn.Module):
         )
         return encoded.reshape(*shape, -1)
 
-    def get_hidden_states(self, prev_actions, rewards, observations):
+    def get_hidden_states(
+        self,
+        prev_actions,
+        rewards,
+        observations,
+        initial_internal_state=None,
+    ):
         encoded_observations = self._encode_observations(observations)
         inputs = torch.cat(
             (
@@ -305,8 +320,10 @@ class RecurrentCritic(nn.Module):
             ),
             dim=-1,
         )
-        hidden_states, _ = self.rnn(inputs)
-        return hidden_states, encoded_observations
+        hidden_states, internal_state = self.rnn(
+            inputs, initial_internal_state
+        )
+        return hidden_states, encoded_observations, internal_state
 
     def _joint_embeddings(
         self,
@@ -314,9 +331,13 @@ class RecurrentCritic(nn.Module):
         rewards,
         observations,
         current_actions,
+        initial_internal_state=None,
     ):
-        hidden_states, encoded_observations = self.get_hidden_states(
-            prev_actions, rewards, observations
+        hidden_states, encoded_observations, _ = self.get_hidden_states(
+            prev_actions,
+            rewards,
+            observations,
+            initial_internal_state,
         )
         if current_actions.shape[0] != observations.shape[0]:
             hidden_states = hidden_states[:-1]
@@ -338,13 +359,19 @@ class RecurrentCritic(nn.Module):
         return shape, flat, no_actions
 
     def forward_sequence(
-        self, prev_actions, rewards, observations, current_actions
+        self,
+        prev_actions,
+        rewards,
+        observations,
+        current_actions,
+        initial_internal_state=None,
     ):
         joint = self._joint_embeddings(
             prev_actions,
             rewards,
             observations,
             current_actions,
+            initial_internal_state,
         )
         shape, flat_joint, no_actions = self._flatten_joint(joint)
         q1 = self.qnet1(flat_joint, no_actions)
@@ -361,9 +388,13 @@ class RecurrentCritic(nn.Module):
         bootstrap,
         discount,
         target_indices=None,
+        initial_internal_state=None,
     ):
-        hidden_states, encoded_observations = self.get_hidden_states(
-            prev_actions, previous_rewards, observations
+        hidden_states, encoded_observations, _ = self.get_hidden_states(
+            prev_actions,
+            previous_rewards,
+            observations,
+            initial_internal_state,
         )
         if target_indices is None:
             target_hidden_states = hidden_states[1:]

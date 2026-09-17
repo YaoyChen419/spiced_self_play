@@ -603,6 +603,21 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logs_dict["actor_loss"] = actor_loss.detach()
         return logs_dict
 
+    def burn_in_recurrent_state(
+        module, prev_actions, prev_rewards, observations, burn_in_length
+    ):
+        if burn_in_length == 0:
+            return None
+        # R2D2/SEED burn-in: update recurrent state on the prefix without
+        # computing a loss or propagating gradients through the prefix.
+        with torch.no_grad():
+            _, _, state = module.get_hidden_states(
+                prev_actions[:burn_in_length],
+                prev_rewards[:burn_in_length],
+                observations[:burn_in_length],
+            )
+        return tuple(value.detach() for value in state)
+
     def update_main_recurrent(data, logs_dict):
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
@@ -617,8 +632,35 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             context_observations = context["observations"]
             context_prev_actions = context["prev_actions"]
             context_prev_rewards = context["prev_rewards"]
-            target_indices = data["target_indices"].long()
+            burn_in_length = full_args["rnn"]["burn_in_length"]
+            target_indices = (
+                data["target_indices"].long() - burn_in_length
+            )
             sequence_length = actions.shape[0]
+            actor_state = burn_in_recurrent_state(
+                actor,
+                context_prev_actions,
+                context_prev_rewards,
+                context_observations,
+                burn_in_length,
+            )
+            qnet_state = burn_in_recurrent_state(
+                qnet,
+                context_prev_actions,
+                context_prev_rewards,
+                context_observations,
+                burn_in_length,
+            )
+            qnet_target_state = burn_in_recurrent_state(
+                qnet_target,
+                context_prev_actions,
+                context_prev_rewards,
+                context_observations,
+                burn_in_length,
+            )
+            context_observations = context_observations[burn_in_length:]
+            context_prev_actions = context_prev_actions[burn_in_length:]
+            context_prev_rewards = context_prev_rewards[burn_in_length:]
             current_observations = context_observations[:sequence_length]
             current_prev_actions = context_prev_actions[:sequence_length]
             current_prev_rewards = context_prev_rewards[:sequence_length]
@@ -637,6 +679,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     context_prev_actions,
                     context_prev_rewards,
                     context_observations,
+                    actor_state,
                 )
                 batch_indices = torch.arange(
                     context_actions.shape[1], device=device
@@ -660,6 +703,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     bootstrap,
                     discount,
                     target_indices,
+                    qnet_target_state,
                 )
                 qf1_target_value = qnet_target.get_value(qf1_target)
                 qf2_target_value = qnet_target.get_value(qf2_target)
@@ -673,6 +717,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 current_prev_rewards,
                 current_observations,
                 actions,
+                qnet_state,
             )
             qf1_loss = -torch.sum(
                 qf1_target * F.log_softmax(qf1, dim=-1), dim=-1, keepdim=True
@@ -710,15 +755,43 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             masks = data["mask"].float()
             num_valid = masks.sum().clamp(min=1.0)
             context = data["context"]
+            burn_in_length = full_args["rnn"]["burn_in_length"]
             sequence_length = actions.shape[0]
-            observations = context["observations"][:sequence_length]
-            prev_actions = context["prev_actions"][:sequence_length]
-            prev_rewards = context["prev_rewards"][:sequence_length]
+            actor_state = burn_in_recurrent_state(
+                actor,
+                context["prev_actions"],
+                context["prev_rewards"],
+                context["observations"],
+                burn_in_length,
+            )
+            qnet_state = burn_in_recurrent_state(
+                qnet,
+                context["prev_actions"],
+                context["prev_rewards"],
+                context["observations"],
+                burn_in_length,
+            )
+            observations = context["observations"][
+                burn_in_length : burn_in_length + sequence_length
+            ]
+            prev_actions = context["prev_actions"][
+                burn_in_length : burn_in_length + sequence_length
+            ]
+            prev_rewards = context["prev_rewards"][
+                burn_in_length : burn_in_length + sequence_length
+            ]
             policy_actions = actor.forward_sequence(
-                prev_actions, prev_rewards, observations
+                prev_actions,
+                prev_rewards,
+                observations,
+                actor_state,
             )
             qf1, qf2 = qnet.forward_sequence(
-                prev_actions, prev_rewards, observations, policy_actions
+                prev_actions,
+                prev_rewards,
+                observations,
+                policy_actions,
+                qnet_state,
             )
             qf1_value = qnet.get_value(F.softmax(qf1, dim=-1))
             qf2_value = qnet.get_value(F.softmax(qf2, dim=-1))
@@ -942,6 +1015,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     data = rb.sample_sequences(
                         full_args["rnn"]["sequence_batch_size"],
                         sequence_length,
+                        full_args["rnn"]["burn_in_length"],
                     )
                 else:
                     data = rb.sample(

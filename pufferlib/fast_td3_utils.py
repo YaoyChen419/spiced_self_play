@@ -526,7 +526,12 @@ class SimpleReplayBuffer(nn.Module):
         return out
 
     @torch.no_grad()
-    def sample_sequences(self, batch_size: int, sequence_length: int):
+    def sample_sequences(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        burn_in_length: int = 0,
+    ):
         """Sample contiguous per-agent sequences with n-step targets.
 
         This follows the sequence layout used by pomdp-baselines: tensors are
@@ -537,7 +542,12 @@ class SimpleReplayBuffer(nn.Module):
         if not self.masked:
             raise RuntimeError("Sequence sampling requires agent-indexed replay")
 
-        sample_length = sequence_length + self.n_steps - 1
+        if burn_in_length < 0:
+            raise ValueError("burn_in_length must be non-negative")
+
+        sample_length = (
+            burn_in_length + sequence_length + self.n_steps - 1
+        )
         eligible = torch.nonzero(
             self.valid_counts >= sample_length, as_tuple=True
         )[0]
@@ -616,11 +626,12 @@ class SimpleReplayBuffer(nn.Module):
             (torch.zeros_like(boundaries[:, :1]), boundaries[:, :-1]), dim=1
         )
         masks = torch.cumprod(1.0 - shifted_boundaries, dim=1)[
-            :, :sequence_length
+            :, burn_in_length : burn_in_length + sequence_length
         ]
 
-        base_indices = torch.arange(
-            sequence_length, device=self.device
+        base_indices = (
+            burn_in_length
+            + torch.arange(sequence_length, device=self.device)
         ).view(1, -1, 1)
         step_offsets = torch.arange(
             self.n_steps, device=self.device
@@ -693,8 +704,12 @@ class SimpleReplayBuffer(nn.Module):
         target_indices = final_transition_indices + 1
 
         return {
-            "observations": observations[:, :sequence_length].transpose(0, 1),
-            "actions": actions[:, :sequence_length].transpose(0, 1),
+            "observations": observations[
+                :, burn_in_length : burn_in_length + sequence_length
+            ].transpose(0, 1),
+            "actions": actions[
+                :, burn_in_length : burn_in_length + sequence_length
+            ].transpose(0, 1),
             "next": {
                 "observations": final_next_observations.transpose(0, 1),
                 "rewards": target_rewards.transpose(0, 1).unsqueeze(-1),
