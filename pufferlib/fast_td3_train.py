@@ -768,8 +768,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         + actor_detach.std_min
     )
     if args.recurrent:
-        recurrent_state_by_id = actor_detach.initial_state(
-            vecenv.num_agents, device
+        recurrent_state_dtype = amp_dtype if amp_enabled else torch.float32
+        recurrent_state_by_id = tuple(
+            state.to(dtype=recurrent_state_dtype)
+            for state in actor_detach.initial_state(vecenv.num_agents, device)
         )
         previous_actions_by_id = torch.zeros(
             vecenv.num_agents, n_act, device=device
@@ -849,7 +851,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 actions = actions.clamp(action_low, action_high)
                 recurrent_state_by_id[0][:, current_ids] = recurrent_state[0]
                 recurrent_state_by_id[1][:, current_ids] = recurrent_state[1]
-                previous_actions_by_id[current_ids] = actions
+                previous_actions_by_id[current_ids] = actions.to(
+                    dtype=previous_actions_by_id.dtype
+                )
             else:
                 actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
