@@ -607,29 +607,43 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
-            observations = data["observations"]
-            next_observations = data["next"]["observations"]
             actions = data["actions"]
             rewards = data["next"]["rewards"]
             dones = data["next"]["dones"].bool()
             truncations = data["next"]["truncations"].bool()
             masks = data["mask"].float()
             num_valid = masks.sum().clamp(min=1.0)
-
-            observs = torch.cat((observations[:1], next_observations), dim=0)
-            prev_actions = torch.cat((torch.zeros_like(actions[:1]), actions), dim=0)
-            prev_rewards = torch.cat((torch.zeros_like(rewards[:1]), rewards), dim=0)
+            context = data["context"]
+            context_observations = context["observations"]
+            context_prev_actions = context["prev_actions"]
+            context_prev_rewards = context["prev_rewards"]
+            target_indices = data["target_indices"].long()
+            sequence_length = actions.shape[0]
+            current_observations = context_observations[:sequence_length]
+            current_prev_actions = context_prev_actions[:sequence_length]
+            current_prev_rewards = context_prev_rewards[:sequence_length]
 
             if args.disable_bootstrap:
                 bootstrap = (~dones).float()
             else:
                 bootstrap = (truncations | ~dones).float()
-            discount = torch.full_like(rewards, args.gamma)
+            discount = torch.pow(
+                args.gamma,
+                data["next"]["effective_n_steps"].float(),
+            )
 
             with torch.no_grad():
-                next_actions = actor.forward_sequence(
-                    prev_actions, prev_rewards, observs
-                )[1:]
+                context_actions = actor.forward_sequence(
+                    context_prev_actions,
+                    context_prev_rewards,
+                    context_observations,
+                )
+                batch_indices = torch.arange(
+                    context_actions.shape[1], device=device
+                ).unsqueeze(0)
+                next_actions = context_actions[
+                    target_indices, batch_indices
+                ]
                 clipped_noise = torch.randn_like(next_actions)
                 clipped_noise = clipped_noise.mul(policy_noise).clamp(
                     -noise_clip, noise_clip
@@ -638,13 +652,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     action_low, action_high
                 )
                 qf1_target, qf2_target = qnet_target.projection_sequence(
-                    prev_actions,
-                    prev_rewards,
-                    observs,
+                    context_prev_actions,
+                    context_prev_rewards,
+                    context_observations,
                     next_actions,
                     rewards,
                     bootstrap,
                     discount,
+                    target_indices,
                 )
                 qf1_target_value = qnet_target.get_value(qf1_target)
                 qf2_target_value = qnet_target.get_value(qf2_target)
@@ -654,7 +669,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     qf1_target = qf2_target = target_dist
 
             qf1, qf2 = qnet.forward_sequence(
-                prev_actions, prev_rewards, observs, actions
+                current_prev_actions,
+                current_prev_rewards,
+                current_observations,
+                actions,
             )
             qf1_loss = -torch.sum(
                 qf1_target * F.log_softmax(qf1, dim=-1), dim=-1, keepdim=True
@@ -688,21 +706,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
-            observations = data["observations"]
-            next_observations = data["next"]["observations"]
             actions = data["actions"]
-            rewards = data["next"]["rewards"]
             masks = data["mask"].float()
             num_valid = masks.sum().clamp(min=1.0)
-
-            observs = torch.cat((observations[:1], next_observations), dim=0)
-            prev_actions = torch.cat((torch.zeros_like(actions[:1]), actions), dim=0)
-            prev_rewards = torch.cat((torch.zeros_like(rewards[:1]), rewards), dim=0)
+            context = data["context"]
+            sequence_length = actions.shape[0]
+            observations = context["observations"][:sequence_length]
+            prev_actions = context["prev_actions"][:sequence_length]
+            prev_rewards = context["prev_rewards"][:sequence_length]
             policy_actions = actor.forward_sequence(
-                prev_actions, prev_rewards, observs
-            )[:-1]
+                prev_actions, prev_rewards, observations
+            )
             qf1, qf2 = qnet.forward_sequence(
-                prev_actions, prev_rewards, observs, policy_actions
+                prev_actions, prev_rewards, observations, policy_actions
             )
             qf1_value = qnet.get_value(F.softmax(qf1, dim=-1))
             qf2_value = qnet.get_value(F.softmax(qf2, dim=-1))
@@ -848,14 +864,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     ),
                     dones=current_dones,
                 )
-                actions = actions.clamp(action_low, action_high)
                 recurrent_state_by_id[0][:, current_ids] = recurrent_state[0]
                 recurrent_state_by_id[1][:, current_ids] = recurrent_state[1]
+            else:
+                actions = policy(obs=norm_obs, dones=dones)
+            if global_step <= args.learning_starts:
+                actions = torch.rand_like(actions).mul(
+                    action_high - action_low
+                ).add(action_low)
+            actions = actions.clamp(action_low, action_high)
+            if args.recurrent:
                 previous_actions_by_id[current_ids] = actions.to(
                     dtype=previous_actions_by_id.dtype
                 )
-            else:
-                actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
@@ -931,10 +952,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         max(1, args.batch_size // args.num_envs),
                         total_batch_size=args.batch_size,
                     )
-                data["observations"] = normalize_obs(data["observations"])
-                data["next"]["observations"] = normalize_obs(
-                    data["next"]["observations"]
-                )
+                if args.recurrent:
+                    data["context"]["observations"] = normalize_obs(
+                        data["context"]["observations"]
+                    )
+                else:
+                    data["observations"] = normalize_obs(data["observations"])
+                    data["next"]["observations"] = normalize_obs(
+                        data["next"]["observations"]
+                    )
                 if envs.asymmetric_obs:
                     data["critic_observations"] = normalize_critic_obs(
                         data["critic_observations"]

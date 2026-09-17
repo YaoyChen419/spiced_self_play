@@ -527,17 +527,19 @@ class SimpleReplayBuffer(nn.Module):
 
     @torch.no_grad()
     def sample_sequences(self, batch_size: int, sequence_length: int):
-        """Sample contiguous per-agent sequences with episode masks.
+        """Sample contiguous per-agent sequences with n-step targets.
 
         This follows the sequence layout used by pomdp-baselines: tensors are
         returned as (time, batch, feature), and transitions after the first
-        terminal or truncation are masked out.
+        terminal or truncation are masked out. N-step rewards, terminal flags,
+        and bootstrap observations follow FastTD3's replay semantics.
         """
         if not self.masked:
             raise RuntimeError("Sequence sampling requires agent-indexed replay")
 
+        sample_length = sequence_length + self.n_steps - 1
         eligible = torch.nonzero(
-            self.valid_counts >= sequence_length, as_tuple=True
+            self.valid_counts >= sample_length, as_tuple=True
         )[0]
         if eligible.numel() == 0:
             raise RuntimeError("No agents have enough transitions for sequence replay")
@@ -558,13 +560,13 @@ class SimpleReplayBuffer(nn.Module):
             ]
             counts = self.valid_counts[candidate_rows]
             oldest = torch.clamp(counts - self.buffer_size, min=0)
-            num_starts = counts - oldest - sequence_length + 1
+            num_starts = counts - oldest - sample_length + 1
             candidate_starts = oldest + (
                 torch.rand(candidate_count, device=self.device) * num_starts
             ).long()
             candidate_indices = (
                 candidate_starts[:, None]
-                + torch.arange(sequence_length, device=self.device)[None, :]
+                + torch.arange(sample_length, device=self.device)[None, :]
             ) % self.buffer_size
             candidate_boundaries = (
                 self.dones[candidate_rows[:, None], candidate_indices].bool()
@@ -597,7 +599,7 @@ class SimpleReplayBuffer(nn.Module):
         rows = torch.cat(sampled_rows)
         starts = torch.cat(sampled_starts)
         logical_indices = starts[:, None] + torch.arange(
-            sequence_length, device=self.device
+            sample_length, device=self.device
         )[None, :]
         indices = logical_indices % self.buffer_size
         row_indices = rows[:, None]
@@ -613,17 +615,99 @@ class SimpleReplayBuffer(nn.Module):
         shifted_boundaries = torch.cat(
             (torch.zeros_like(boundaries[:, :1]), boundaries[:, :-1]), dim=1
         )
-        masks = torch.cumprod(1.0 - shifted_boundaries, dim=1)
+        masks = torch.cumprod(1.0 - shifted_boundaries, dim=1)[
+            :, :sequence_length
+        ]
+
+        base_indices = torch.arange(
+            sequence_length, device=self.device
+        ).view(1, -1, 1)
+        step_offsets = torch.arange(
+            self.n_steps, device=self.device
+        ).view(1, 1, -1)
+        n_step_indices = (base_indices + step_offsets).expand(
+            batch_size, -1, -1
+        )
+        expanded_shape = (batch_size, sequence_length, sample_length)
+        n_step_rewards = torch.gather(
+            rewards[:, None, :].expand(expanded_shape), 2, n_step_indices
+        )
+        n_step_dones = torch.gather(
+            dones[:, None, :].expand(expanded_shape), 2, n_step_indices
+        )
+        n_step_truncations = torch.gather(
+            truncations[:, None, :].expand(expanded_shape), 2, n_step_indices
+        )
+
+        shifted_dones = torch.cat(
+            (
+                torch.zeros_like(n_step_dones[:, :, :1]),
+                n_step_dones[:, :, :-1],
+            ),
+            dim=2,
+        )
+        reward_masks = torch.cumprod(1.0 - shifted_dones, dim=2)
+        effective_n_steps = reward_masks.sum(dim=2).long()
+        discounts = torch.pow(
+            self.gamma,
+            torch.arange(self.n_steps, device=self.device),
+        ).view(1, 1, -1)
+        target_rewards = (
+            n_step_rewards * reward_masks * discounts
+        ).sum(dim=2)
+
+        n_step_boundaries = n_step_dones.bool() | n_step_truncations.bool()
+        has_boundary = n_step_boundaries.any(dim=2)
+        first_boundary = n_step_boundaries.float().argmax(dim=2)
+        final_offsets = torch.where(
+            has_boundary,
+            first_boundary,
+            torch.full_like(first_boundary, self.n_steps - 1),
+        )
+        final_transition_indices = (
+            base_indices.squeeze(-1) + final_offsets
+        )
+        final_next_observations = torch.gather(
+            next_observations,
+            1,
+            final_transition_indices.unsqueeze(-1).expand(
+                -1, -1, self.n_obs
+            ),
+        )
+        final_dones = torch.gather(
+            dones, 1, final_transition_indices
+        )
+        final_truncations = torch.gather(
+            truncations, 1, final_transition_indices
+        )
+
+        context_observations = torch.cat(
+            (observations[:, :1], next_observations), dim=1
+        )
+        context_actions = torch.cat(
+            (torch.zeros_like(actions[:, :1]), actions), dim=1
+        )
+        context_rewards = torch.cat(
+            (torch.zeros_like(rewards[:, :1]), rewards), dim=1
+        ).unsqueeze(-1)
+        target_indices = final_transition_indices + 1
 
         return {
-            "observations": observations.transpose(0, 1),
-            "actions": actions.transpose(0, 1),
+            "observations": observations[:, :sequence_length].transpose(0, 1),
+            "actions": actions[:, :sequence_length].transpose(0, 1),
             "next": {
-                "observations": next_observations.transpose(0, 1),
-                "rewards": rewards.transpose(0, 1).unsqueeze(-1),
-                "dones": dones.transpose(0, 1).unsqueeze(-1),
-                "truncations": truncations.transpose(0, 1).unsqueeze(-1),
+                "observations": final_next_observations.transpose(0, 1),
+                "rewards": target_rewards.transpose(0, 1).unsqueeze(-1),
+                "dones": final_dones.transpose(0, 1).unsqueeze(-1),
+                "truncations": final_truncations.transpose(0, 1).unsqueeze(-1),
+                "effective_n_steps": effective_n_steps.transpose(0, 1).unsqueeze(-1),
             },
+            "context": {
+                "observations": context_observations.transpose(0, 1),
+                "prev_actions": context_actions.transpose(0, 1),
+                "prev_rewards": context_rewards.transpose(0, 1),
+            },
+            "target_indices": target_indices.transpose(0, 1),
             "mask": masks.transpose(0, 1).unsqueeze(-1),
         }
 

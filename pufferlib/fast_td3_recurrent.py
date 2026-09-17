@@ -360,18 +360,32 @@ class RecurrentCritic(nn.Module):
         rewards,
         bootstrap,
         discount,
+        target_indices=None,
     ):
         hidden_states, encoded_observations = self.get_hidden_states(
             prev_actions, previous_rewards, observations
         )
+        if target_indices is None:
+            target_hidden_states = hidden_states[1:]
+            target_observations = encoded_observations[1:]
+        else:
+            batch_indices = torch.arange(
+                hidden_states.shape[1], device=hidden_states.device
+            ).unsqueeze(0)
+            target_hidden_states = hidden_states[
+                target_indices, batch_indices
+            ]
+            target_observations = encoded_observations[
+                target_indices, batch_indices
+            ]
         shortcut = torch.cat(
             (
-                encoded_observations[1:],
+                target_observations,
                 self.current_action_embedder(next_actions),
             ),
             dim=-1,
         )
-        joint = torch.cat((hidden_states[1:], shortcut), dim=-1)
+        joint = torch.cat((target_hidden_states, shortcut), dim=-1)
         shape, flat_joint, no_actions = self._flatten_joint(joint)
         flat_rewards = rewards.reshape(-1)
         flat_bootstrap = bootstrap.reshape(-1)
