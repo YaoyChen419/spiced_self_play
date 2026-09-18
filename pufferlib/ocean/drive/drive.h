@@ -2753,8 +2753,9 @@ void c_step(Drive *env) {
 
         if (env->pbrs_scale != 0.0f) {
             bool true_terminal = goal_reached_this_step && env->goal_behavior != GOAL_GENERATE_NEW;
+            bool episode_ends = true_terminal || (env->timestep + 1 >= env->episode_length);
             float next_potential = 0.0f;
-            if (!true_terminal && !goal_reached_this_step) {
+            if (!episode_ends && !goal_reached_this_step) {
                 float initial_distance = fmaxf(env->entities[agent_idx].init_dist_to_goal, 1e-6f);
                 next_potential = 1.0f - distance_to_goal / initial_distance;
                 next_potential = fminf(1.0f, fmaxf(-1.0f, next_potential));
