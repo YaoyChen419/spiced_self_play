@@ -395,12 +395,21 @@ class SimpleReplayBuffer(nn.Module):
 
             # Create masks for rewards *after* first done
             # This creates a cumulative product that zeroes out rewards after the first done
-            all_dones_shifted = torch.cat(
-                [torch.zeros_like(all_dones[:, :, :1]), all_dones[:, :, :-1]], dim=2
+            # FIX A8 (v5): the reward mask must stop at truncations too, not
+            # only at dones, or rewards from the next episode get summed while
+            # the bootstrap state is only d+1 steps ahead.
+            all_boundaries_shifted = torch.cat(
+                [
+                    torch.zeros_like(all_dones[:, :, :1]),
+                    (all_dones | all_truncations)[:, :, :-1],
+                ],
+                dim=2,
             )  # First reward should not be masked
             done_masks = torch.cumprod(
-                1.0 - all_dones_shifted, dim=2
+                1.0 - all_boundaries_shifted, dim=2
             )  # [n_env, batch_size, n_step]
+# [v5-fix] A8: non-recurrent n-step mask respects truncations
+
             effective_n_steps = done_masks.sum(2)
 
             # Create discount factors
@@ -552,7 +561,23 @@ class SimpleReplayBuffer(nn.Module):
             self.valid_counts >= sample_length, as_tuple=True
         )[0]
         if eligible.numel() == 0:
-            raise RuntimeError("No agents have enough transitions for sequence replay")
+            # FIX A1 (v5): report the actual counts so the starvation is
+            # diagnosable instead of a bare assertion.
+            raise RuntimeError(
+                "No agents have enough transitions for sequence replay: "
+                "need valid_counts >= %d, got max=%d, eligible=%d/%d, "
+                "mean_count=%.2f, ptr=%d"
+                % (
+                    sample_length,
+                    int(self.valid_counts.max()),
+                    int(eligible.numel()),
+                    self.n_env,
+                    float(self.valid_counts.float().mean()),
+                    int(self.ptr),
+                )
+            )
+# [v5-fix] A1: diagnosable sample_sequences error
+
 
         # Match pomdp-baselines valid-start rule: a sampled window either stays
         # inside one episode, or starts at the beginning of a short episode.
@@ -650,15 +675,21 @@ class SimpleReplayBuffer(nn.Module):
             truncations[:, None, :].expand(expanded_shape), 2, n_step_indices
         )
 
+        # FIX A8 (v5): the window is selected with dones|truncations but the
+        # reward mask only looked at dones, so rewards from the NEXT episode
+        # were summed while the bootstrap state was only d+1 steps ahead.
+        n_step_boundaries_early = n_step_dones.bool() | n_step_truncations.bool()
         shifted_dones = torch.cat(
             (
-                torch.zeros_like(n_step_dones[:, :, :1]),
-                n_step_dones[:, :, :-1],
+                torch.zeros_like(n_step_boundaries_early[:, :, :1]),
+                n_step_boundaries_early[:, :, :-1],
             ),
             dim=2,
         )
-        reward_masks = torch.cumprod(1.0 - shifted_dones, dim=2)
+        reward_masks = torch.cumprod(1.0 - shifted_dones.float(), dim=2)
         effective_n_steps = reward_masks.sum(dim=2).long()
+# [v5-fix] A8: recurrent n-step mask respects truncations
+
         discounts = torch.pow(
             self.gamma,
             torch.arange(self.n_steps, device=self.device),

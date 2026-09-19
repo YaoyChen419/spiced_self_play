@@ -34,7 +34,19 @@ from torch.amp import autocast, GradScaler
 
 from tensordict import TensorDict
 
+# --- FIX A3 (v5): kinematic envelope of the delta-local action channel ---
+# The env's acceleration slew limiter (drive.h:1977-1984) can change the
+# normalised action u = prev_action_dx / DELTA_MAX_DX by at most
+#     S = A_LONG_MAX * dt^2 / DELTA_MAX_DX = 8.0 * 0.01 / 3.5 = 0.022857
+# per step.  Anything larger saturates, so with the raw residual
+# `obs[:,10] + actions[:,0]` every |a| > S produced the IDENTICAL next
+# state: 97.7% of the action range was a dead zone, the critic saw a Q
+# flat in a, and the actor's policy gradient collapsed to ~0.
+RESIDUAL_ACTION_SCALE = 0.02285714285714286
+
 from pufferlib.fast_td3_utils import (
+# [v5-fix] A3: add RESIDUAL_ACTION_SCALE constant
+
     EmpiricalNormalization,
     RewardNormalizer,
     PerTaskRewardNormalizer,
@@ -83,9 +95,16 @@ class PufferDriveEnv:
             env_actions = actions.clone()
             # Residual Policy Learning: zero longitudinal residual preserves
             # the previously executed delta-local forward motion.
+            # FIX A3 (v5): scale by the achievable per-step change, otherwise
+            # every |a| > RESIDUAL_ACTION_SCALE saturates to the same next state.
             env_actions[:, 0] = torch.clamp(
-                self.observations[:, 10] + actions[:, 0], -1.0, 1.0
+                self.observations[:, 10]
+                + RESIDUAL_ACTION_SCALE * actions[:, 0],
+                -1.0,
+                1.0,
             )
+# [v5-fix] A3b: scale the longitudinal residual
+
         self.vecenv.send(env_actions.detach().cpu().numpy())
         observations, rewards, terminals, truncations, infos, agent_ids, masks = self.vecenv.recv()
 
@@ -188,6 +207,41 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args.num_envs = vecenv.observation_space.shape[0]
     total_agent_timesteps = args.total_timesteps
     args.total_timesteps = math.ceil(total_agent_timesteps / args.num_envs)
+
+    # --- FIX A1 (v5): make the recurrent replay warm-up reachable -----------
+    # `args.num_envs` is the observation-space batch (agents_per_batch =
+    # driver_env.num_agents * vec.batch_size) while the replay buffer is
+    # allocated with n_env = vecenv.num_agents (= driver_env.num_agents *
+    # vec.num_envs).  Sequence sampling needs
+    #     valid_counts[row] >= burn_in + sequence_length + n_steps - 1
+    # but valid_counts grows by only (vec.batch_size / vec.num_envs) per
+    # iteration, so learning_starts must cover sample_length / coverage or the
+    # first optimizer step raises
+    #     RuntimeError: No agents have enough transitions for sequence replay
+    if args.recurrent:
+        _coverage = args.num_envs / float(vecenv.num_agents)
+        _sample_length = (
+            full_args["rnn"]["burn_in_length"]
+            + full_args["rnn"]["sequence_length"]
+            + args.num_steps
+            - 1
+        )
+        _required = math.ceil(_sample_length / _coverage) + 1
+        if args.learning_starts < _required:
+            print(
+                "[A1] learning_starts %d -> %d "
+                "(sample_length=%d, coverage=%.3f, agents_per_batch=%d, slots=%d)"
+                % (
+                    args.learning_starts,
+                    _required,
+                    _sample_length,
+                    _coverage,
+                    args.num_envs,
+                    vecenv.num_agents,
+                )
+            )
+            args.learning_starts = _required
+# [v5-fix] A1: auto-raise learning_starts from replay coverage
 
     print(args)
 
@@ -413,11 +467,38 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         lr=torch.tensor(args.critic_learning_rate, device=device),
         weight_decay=args.weight_decay,
     )
+    # FIX A4 (v5): AdamW's decoupled decay is (1 - lr*wd) per step and is
+    # applied to the actor unconditionally.  Over 38.4k iterations at
+    # lr=3e-4, wd=0.1 that is (1-3e-5)^38400 = 0.316, i.e. a 68% weight shrink
+    # from decay alone.  With the A3 policy gradient ~0, decay dominates and
+    # drives the actor to the constant "hold previous action" solution.
+    # `actor_weight_decay` is a new config key (default 0.0 for this task).
+    def _param_groups(module, wd):
+        decay, no_decay = [], []
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if (
+                param.ndim <= 1
+                or name.endswith(".bias")
+                or "norm" in name.lower()
+                or "lstm" in name.lower()
+            ):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        return [
+            {"params": decay, "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    _actor_wd = float(getattr(args, "actor_weight_decay", 0.0))
     actor_optimizer = optim.AdamW(
-        list(actor.parameters()),
+        _param_groups(actor, _actor_wd),
         lr=torch.tensor(args.actor_learning_rate, device=device),
-        weight_decay=args.weight_decay,
     )
+# [v5-fix] A4: actor_weight_decay (default 0.0)
+
 
     # Add learning rate schedulers
     q_scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -503,10 +584,16 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             else:
                 bootstrap = (truncations | ~dones).float()
 
+            # FIX A11 (v5): the residual is scaled by RESIDUAL_ACTION_SCALE
+            # before reaching the env, so the target smoothing must be scaled
+            # identically or it is ~44x smaller than intended.
             clipped_noise = torch.randn_like(actions)
             clipped_noise = clipped_noise.mul(policy_noise).clamp(
                 -noise_clip, noise_clip
             )
+            clipped_noise = clipped_noise * RESIDUAL_ACTION_SCALE
+# [v5-fix] A11: scale target smoothing (MLP path)
+
 
             next_state_actions = (actor(next_observations) + clipped_noise).clamp(
                 action_low, action_high
@@ -552,13 +639,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         scaler.scale(qf_loss).backward()
         scaler.unscale_(q_optimizer)
 
-        if args.use_grad_norm_clipping:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                qnet.parameters(),
-                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
-            )
-        else:
-            critic_grad_norm = torch.tensor(0.0, device=device)
+        # FIX A5 (v5): always MEASURE the norm; only skip the CLIP.  The old
+        # code hard-coded 0.0 when clipping was off, so a dead actor was
+        # indistinguishable from disabled clipping in the logs.
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            qnet.parameters(),
+            max_norm=(
+                args.max_grad_norm
+                if args.use_grad_norm_clipping and args.max_grad_norm > 0
+                else float("inf")
+            ),
+        )
+# [v5-fix] A5: critic grad-norm measurement
+
         scaler.step(q_optimizer)
         scaler.update()
 
@@ -590,13 +683,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         actor_optimizer.zero_grad(set_to_none=True)
         scaler.scale(actor_loss).backward()
         scaler.unscale_(actor_optimizer)
-        if args.use_grad_norm_clipping:
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                actor.parameters(),
-                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
-            )
-        else:
-            actor_grad_norm = torch.tensor(0.0, device=device)
+        # FIX A5 (v5): always MEASURE the norm; only skip the CLIP.
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            actor.parameters(),
+            max_norm=(
+                args.max_grad_norm
+                if args.use_grad_norm_clipping and args.max_grad_norm > 0
+                else float("inf")
+            ),
+        )
+# [v5-fix] A5: actor grad-norm measurement
+
         scaler.step(actor_optimizer)
         scaler.update()
         logs_dict["actor_grad_norm"] = actor_grad_norm.detach()
@@ -687,10 +784,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 next_actions = context_actions[
                     target_indices, batch_indices
                 ]
+                # FIX A11 (v5): same scaling as the MLP path.
                 clipped_noise = torch.randn_like(next_actions)
                 clipped_noise = clipped_noise.mul(policy_noise).clamp(
                     -noise_clip, noise_clip
                 )
+                clipped_noise = clipped_noise * RESIDUAL_ACTION_SCALE
+# [v5-fix] A11: scale target smoothing (recurrent path)
+
                 next_actions = (next_actions + clipped_noise).clamp(
                     action_low, action_high
                 )
@@ -730,13 +831,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         q_optimizer.zero_grad(set_to_none=True)
         scaler.scale(qf_loss).backward()
         scaler.unscale_(q_optimizer)
-        if args.use_grad_norm_clipping:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                qnet.parameters(),
-                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
-            )
-        else:
-            critic_grad_norm = torch.tensor(0.0, device=device)
+        # FIX A5 (v5): always MEASURE the norm; only skip the CLIP.  The old
+        # code hard-coded 0.0 when clipping was off, so a dead actor was
+        # indistinguishable from disabled clipping in the logs.
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            qnet.parameters(),
+            max_norm=(
+                args.max_grad_norm
+                if args.use_grad_norm_clipping and args.max_grad_norm > 0
+                else float("inf")
+            ),
+        )
+# [v5-fix] A5: critic grad-norm measurement
+
         scaler.step(q_optimizer)
         scaler.update()
 
@@ -804,13 +911,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         actor_optimizer.zero_grad(set_to_none=True)
         scaler.scale(actor_loss).backward()
         scaler.unscale_(actor_optimizer)
-        if args.use_grad_norm_clipping:
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                actor.parameters(),
-                max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf"),
-            )
-        else:
-            actor_grad_norm = torch.tensor(0.0, device=device)
+        # FIX A5 (v5): always MEASURE the norm; only skip the CLIP.
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            actor.parameters(),
+            max_norm=(
+                args.max_grad_norm
+                if args.use_grad_norm_clipping and args.max_grad_norm > 0
+                else float("inf")
+            ),
+        )
+# [v5-fix] A5: actor grad-norm measurement
+
         scaler.step(actor_optimizer)
         scaler.update()
         logs_dict["actor_grad_norm"] = actor_grad_norm.detach()
@@ -1072,7 +1183,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
                         "env_rewards": rewards.mean(),
                         "buffer_rewards": raw_rewards.mean(),
+                        # FIX A1/A3/A7 (v5): without these the failure is
+                        # structurally invisible.
+                        "valid_frac": (
+                            infos["valid"].float().mean()
+                            if "valid" in infos
+                            else torch.tensor(1.0, device=device)
+                        ),
+                        "agent_dead": envs.agent_dead.sum().float(),
+                        "valid_counts_max": rb.valid_counts.max().float(),
+                        "act_abs_mean": actions.abs().mean(),
                     }
+# [v5-fix] A1/A3/A7: add the missing metrics
+
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                         print(f"Evaluating at global step {global_step}")
