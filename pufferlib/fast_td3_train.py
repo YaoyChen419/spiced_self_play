@@ -13,6 +13,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 import random
 import time
 import math
+from collections import defaultdict
 from types import SimpleNamespace
 
 import tqdm
@@ -32,6 +33,7 @@ import torch.optim as optim
 from torch.amp import autocast, GradScaler
 
 from tensordict import TensorDict
+from pufferlib.pufferlib import unroll_nested_dict
 
 from pufferlib.fast_td3_utils import (
     EmpiricalNormalization,
@@ -123,6 +125,7 @@ class PufferDriveEnv:
         self.agent_ids = agent_ids.copy()
         self.observations = observations
         info = {
+            "env_infos": infos,
             "time_outs": truncations,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
@@ -604,6 +607,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     start_time = None
     desc = ""
     all_logs = []
+    stats = defaultdict(list)
+    agent_steps = torch.zeros((), device=device, dtype=torch.long)
+    valid_steps = torch.zeros((), device=device, dtype=torch.long)
+    total_steps = 0
+    last_log_step = 0
+    last_log_time = run_start_time = time.time()
     model_dir = os.path.join(args.data_dir, f"{env_name}_{logger.run_id}")
 
     def checkpoint_path(step):
@@ -617,7 +626,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             and global_step >= args.measure_burnin + args.learning_starts
         ):
             start_time = time.time()
-            measure_burnin = global_step
 
         with torch.no_grad(), autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
@@ -635,11 +643,26 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
+        for info in infos["env_infos"]:
+            if "_fasttd3_transition" in info:
+                continue
+            for key, value in unroll_nested_dict(info):
+                if isinstance(value, np.ndarray):
+                    value = value.tolist()
+                if isinstance(value, (list, tuple)):
+                    stats[key].extend(value)
+                else:
+                    stats[key].append(value)
         previous = infos["transition"]
         if previous is None:
             obs = next_obs
             continue
         truncations = infos["time_outs"]
+        valid = infos["valid"]
+        n_valid = valid.sum()
+        agent_steps += n_valid
+        valid_steps += n_valid
+        total_steps += valid.numel()
 
         if args.reward_normalization:
             if env_type == "mtbench":
@@ -724,18 +747,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 soft_update(qnet, qnet_target, args.tau)
 
             if global_step % 100 == 0 and start_time is not None:
-                speed = (global_step - measure_burnin) / (time.time() - start_time)
+                logged_agent_steps = int(agent_steps.item())
+                now = time.time()
+                speed = (logged_agent_steps - last_log_step) / max(now - last_log_time, 1e-8)
                 pbar.set_description(f"{speed: 4.4f} sps, " + desc)
+                for key in list(stats.keys()):
+                    try:
+                        stats[key] = np.mean(stats[key])
+                    except (TypeError, ValueError):
+                        del stats[key]
                 with torch.no_grad():
                     logs = {
-                        "actor_loss": logs_dict["actor_loss"].mean(),
-                        "qf_loss": logs_dict["qf_loss"].mean(),
-                        "qf_max": logs_dict["qf_max"].mean(),
-                        "qf_min": logs_dict["qf_min"].mean(),
-                        "actor_grad_norm": logs_dict["actor_grad_norm"].mean(),
-                        "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
-                        "env_rewards": rewards.mean(),
-                        "buffer_rewards": raw_rewards.mean(),
+                        "losses/actor_loss": logs_dict["actor_loss"].mean(),
+                        "losses/qf_loss": logs_dict["qf_loss"].mean(),
                     }
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
@@ -743,14 +767,22 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         logs.update(evaluate())
 
                 logs = {
-                    "speed": speed,
-                    "frame": global_step * args.num_envs,
-                    "critic_lr": q_scheduler.get_last_lr()[0],
-                    "actor_lr": actor_scheduler.get_last_lr()[0],
+                    "SPS": speed,
+                    "agent_steps": logged_agent_steps,
+                    "environment/perc_transitions_used": valid_steps.item() / max(total_steps, 1),
+                    "uptime": now - run_start_time,
+                    "learning_rate/critic": q_scheduler.get_last_lr()[0],
+                    "learning_rate/actor": actor_scheduler.get_last_lr()[0],
+                    **{f"environment/{key}": value for key, value in stats.items()},
                     **logs,
                 }
-                logger.log(logs, step=global_step * args.num_envs)
+                logger.log(logs, step=logged_agent_steps)
                 all_logs.append(logs)
+                stats = defaultdict(list)
+                valid_steps.zero_()
+                total_steps = 0
+                last_log_step = logged_agent_steps
+                last_log_time = time.time()
 
             if (
                 args.save_interval > 0
