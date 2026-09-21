@@ -146,6 +146,7 @@
 #define GOAL_REMOVE 0
 #define GOAL_GENERATE_NEW 1
 #define GOAL_STOP 2
+#define GOAL_CONTINUE 3
 
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
@@ -2630,7 +2631,7 @@ void c_step(Drive *env) {
     // Re-assert terminal for agents already terminated in a prior step
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
-        if (env->entities[agent_idx].removed) {
+        if (env->entities[agent_idx].removed || env->entities[agent_idx].stopped) {
             env->terminals[i] = 1;
         }
     }
@@ -2711,6 +2712,9 @@ void c_step(Drive *env) {
 
         if ((collision_state || offroad_state) && !agent_is_done) {
             env->entities[agent_idx].failure_before_goal = 1;
+            if (env->entities[agent_idx].stopped) {
+                env->terminals[i] = 1;
+            }
         }
 
         // Check if agent reached goal
@@ -2725,7 +2729,8 @@ void c_step(Drive *env) {
         bool within_distance = distance_to_goal < env->goal_radius;
         bool within_speed = current_speed <= env->goal_speed;
 
-        if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
+        if (within_distance && within_speed && !env->terminals[i] &&
+            !env->entities[agent_idx].current_goal_reached) {
             float r_goal = env->entities[agent_idx].reward_goal_cond;
             env->rewards[i] += r_goal;
             env->logs[i].episode_return += r_goal;
@@ -3889,7 +3894,8 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 };
 
                 if (agent_index == env->human_agent_idx &&
-                    !env->entities[env->active_agent_indices[agent_index]].current_goal_reached) {
+                    (!env->entities[env->active_agent_indices[agent_index]].current_goal_reached ||
+                     env->goal_behavior == GOAL_CONTINUE)) {
                     draw_agent_obs(env, agent_index, mode, obs_only, lasers);
                 }
 
@@ -3984,7 +3990,8 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 // Draw obs for selected agent index
                 if (agent_index == env->human_agent_idx &&
                     (!env->entities[env->active_agent_indices[agent_index]].current_goal_reached ||
-                     env->goal_behavior == GOAL_GENERATE_NEW || env->goal_behavior == GOAL_STOP)) {
+                     env->goal_behavior == GOAL_GENERATE_NEW || env->goal_behavior == GOAL_STOP ||
+                     env->goal_behavior == GOAL_CONTINUE)) {
                     draw_agent_obs(env, agent_index, mode, obs_only, lasers);
                 }
 
