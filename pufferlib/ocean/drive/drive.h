@@ -2738,6 +2738,9 @@ void c_step(Drive *env) {
             env->entities[agent_idx].current_goal_reached = 1;
             env->logs[i].speed_at_goal = current_speed;
 
+            if (env->goal_behavior == GOAL_CONTINUE) {
+                env->logs[i].route_progress = 1.0f;
+            }
             if (env->goal_behavior == GOAL_GENERATE_NEW) {
                 sample_new_goal(env, agent_idx);
                 env->entities[agent_idx].current_goal_reached = 0;

@@ -126,6 +126,7 @@ class PufferDriveEnv:
         self.observations = observations
         info = {
             "env_infos": infos,
+            "terminals": terminals,
             "time_outs": truncations,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
@@ -609,6 +610,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     all_logs = []
     stats = defaultdict(list)
     agent_steps = torch.zeros((), device=device, dtype=torch.long)
+    reward_sum = torch.zeros((), device=device)
+    terminal_steps = torch.zeros_like(agent_steps)
+    truncation_steps = torch.zeros_like(agent_steps)
     valid_steps = torch.zeros((), device=device, dtype=torch.long)
     total_steps = 0
     last_log_step = 0
@@ -663,6 +667,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         agent_steps += n_valid
         valid_steps += n_valid
         total_steps += valid.numel()
+        reward_sum += rewards[valid].sum()
+        terminal_steps += (infos["terminals"] & valid).sum()
+        truncation_steps += (truncations & valid).sum()
 
         if args.reward_normalization:
             if env_type == "mtbench":
@@ -770,6 +777,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     "SPS": speed,
                     "agent_steps": logged_agent_steps,
                     "environment/perc_transitions_used": valid_steps.item() / max(total_steps, 1),
+                    "environment/raw_transition_reward_mean": reward_sum.item() / max(valid_steps.item(), 1),
+                    "environment/terminal_fraction": terminal_steps.item() / max(valid_steps.item(), 1),
+                    "environment/truncation_fraction": truncation_steps.item() / max(valid_steps.item(), 1),
                     "uptime": now - run_start_time,
                     "learning_rate/critic": q_scheduler.get_last_lr()[0],
                     "learning_rate/actor": actor_scheduler.get_last_lr()[0],
@@ -782,6 +792,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 valid_steps.zero_()
                 total_steps = 0
                 last_log_step = logged_agent_steps
+                reward_sum.zero_()
+                terminal_steps.zero_()
+                truncation_steps.zero_()
                 last_log_time = time.time()
 
             if (
