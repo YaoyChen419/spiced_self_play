@@ -13,6 +13,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 import random
 import time
 import math
+from collections import defaultdict
 from types import SimpleNamespace
 
 import tqdm
@@ -33,6 +34,7 @@ from torch.amp import autocast, GradScaler
 
 from tensordict import TensorDict
 
+import pufferlib
 from pufferlib.fast_td3_utils import (
     EmpiricalNormalization,
     RewardNormalizer,
@@ -48,6 +50,31 @@ try:
     import jax.numpy as jnp
 except ImportError:
     pass
+
+
+def _collect_environment_stats(stats, infos):
+    """Collect PufferDrive info using the native PuffeRL aggregation semantics."""
+    for info in infos:
+        for key, value in pufferlib.unroll_nested_dict(info):
+            if key.startswith("_"):
+                continue
+            if isinstance(value, np.ndarray):
+                value = value.tolist()
+            elif isinstance(value, (list, tuple)):
+                stats[key].extend(value)
+                continue
+            stats[key].append(value)
+
+
+def _mean_environment_stats(stats):
+    logs = {}
+    for key, values in stats.items():
+        try:
+            logs[f"environment/{key}"] = np.mean(values)
+        except (TypeError, ValueError):
+            pass
+    stats.clear()
+    return logs
 
 
 class PufferDriveEnv:
@@ -126,7 +153,9 @@ class PufferDriveEnv:
             "time_outs": truncations,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
+            "mask": torch.as_tensor(masks, device=self.device, dtype=torch.bool),
             "valid": valid,
+            "environment_infos": infos,
         }
         return observations, rewards, dones, info
 
@@ -596,12 +625,22 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         qnet.load_state_dict(torch_checkpoint["qnet_state_dict"])
         qnet_target.load_state_dict(torch_checkpoint["qnet_target_state_dict"])
         global_step = torch_checkpoint["global_step"]
+        agent_steps = torch_checkpoint.get(
+            "agent_steps", global_step * args.num_envs
+        )
     else:
         global_step = 0
+        agent_steps = 0
 
     dones = None
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
+    run_start_time = time.time()
     start_time = None
+    last_log_time = run_start_time
+    last_log_agent_steps = agent_steps
+    interval_received = 0
+    interval_valid = 0
+    environment_stats = defaultdict(list)
     desc = ""
     all_logs = []
     model_dir = os.path.join(args.data_dir, f"{env_name}_{logger.run_id}")
@@ -617,7 +656,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             and global_step >= args.measure_burnin + args.learning_starts
         ):
             start_time = time.time()
-            measure_burnin = global_step
+            last_log_time = start_time
+            last_log_agent_steps = agent_steps
 
         with torch.no_grad(), autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
@@ -640,6 +680,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             obs = next_obs
             continue
         truncations = infos["time_outs"]
+        received = int(infos["mask"].sum().item())
+        valid = int(infos["valid"].sum().item())
+        agent_steps += received
+        interval_received += received
+        interval_valid += valid
+        _collect_environment_stats(environment_stats, infos["environment_infos"])
 
         if args.reward_normalization:
             if env_type == "mtbench":
@@ -724,8 +770,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 soft_update(qnet, qnet_target, args.tau)
 
             if global_step % 100 == 0 and start_time is not None:
-                speed = (global_step - measure_burnin) / (time.time() - start_time)
-                pbar.set_description(f"{speed: 4.4f} sps, " + desc)
+                now = time.time()
+                sps = (agent_steps - last_log_agent_steps) / (now - last_log_time)
+                pbar.set_description(f"{sps: 4.4f} sps, " + desc)
                 with torch.no_grad():
                     logs = {
                         "actor_loss": logs_dict["actor_loss"].mean(),
@@ -736,6 +783,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
                         "env_rewards": rewards.mean(),
                         "buffer_rewards": raw_rewards.mean(),
+                        **_mean_environment_stats(environment_stats),
                     }
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
@@ -743,14 +791,22 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         logs.update(evaluate())
 
                 logs = {
-                    "speed": speed,
-                    "frame": global_step * args.num_envs,
+                    "SPS": sps,
+                    "agent_steps": agent_steps,
+                    "uptime": time.time() - run_start_time,
+                    "environment/perc_transitions_used": (
+                        interval_valid / interval_received if interval_received else 0.0
+                    ),
                     "critic_lr": q_scheduler.get_last_lr()[0],
                     "actor_lr": actor_scheduler.get_last_lr()[0],
                     **logs,
                 }
-                logger.log(logs, step=global_step * args.num_envs)
+                logger.log(logs, step=agent_steps)
                 all_logs.append(logs)
+                interval_received = 0
+                interval_valid = 0
+                last_log_time = now
+                last_log_agent_steps = agent_steps
 
             if (
                 args.save_interval > 0
@@ -767,6 +823,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     critic_obs_normalizer,
                     args,
                     checkpoint_path(global_step),
+                    agent_steps=agent_steps,
                 )
 
         global_step += 1
@@ -784,6 +841,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         critic_obs_normalizer,
         args,
         final_path,
+        agent_steps=agent_steps,
     )
     vecenv.close()
     logger.close(final_path)

@@ -816,6 +816,7 @@ def save_params(
     critic_obs_normalizer,
     args,
     save_path,
+    agent_steps=None,
 ):
     """Save model parameters and training configuration to disk."""
 
@@ -842,6 +843,7 @@ def save_params(
         ),
         "args": vars(args),  # Save all arguments
         "global_step": global_step,
+        "agent_steps": agent_steps,
     }
     torch.save(save_dict, save_path, _use_new_zipfile_serialization=True)
     print(f"Saved parameters and configuration to {save_path}")
