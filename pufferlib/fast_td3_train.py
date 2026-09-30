@@ -182,7 +182,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args.cuda = cuda
     args.device_rank = device_rank
     args.checkpoint_path = full_args.get("load_model_path")
-    args.eval_interval = full_args.get("eval", {}).get("eval_interval", 0)
+    args.eval_interval_agent_steps = full_args.get("eval", {}).get("eval_interval_agent_steps", 0)
     args.save_interval = train_config["checkpoint_interval"]
 
     if logger is None:
@@ -632,6 +632,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         global_step = 0
         agent_steps = 0
 
+    next_eval_step = (
+        (agent_steps // args.eval_interval_agent_steps + 1) * args.eval_interval_agent_steps
+        if args.eval_interval_agent_steps > 0 else None
+    )
     dones = None
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     run_start_time = time.time()
@@ -769,7 +773,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
                 soft_update(qnet, qnet_target, args.tau)
 
-            if global_step % 100 == 0 and start_time is not None:
+            eval_due = next_eval_step is not None and agent_steps >= next_eval_step
+            if (global_step % 100 == 0 and start_time is not None) or eval_due:
                 now = time.time()
                 sps = (agent_steps - last_log_agent_steps) / (now - last_log_time)
                 pbar.set_description(f"{sps: 4.4f} sps, " + desc)
@@ -786,9 +791,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                         **_mean_environment_stats(environment_stats),
                     }
 
-                    if args.eval_interval > 0 and global_step % args.eval_interval == 0:
-                        print(f"Evaluating at global step {global_step}")
+                    if eval_due:
+                        print(f"Evaluating at agent step {agent_steps}")
                         logs.update(evaluate())
+                        next_eval_step = (
+                            agent_steps // args.eval_interval_agent_steps + 1
+                        ) * args.eval_interval_agent_steps
 
                 logs = {
                     "SPS": sps,
