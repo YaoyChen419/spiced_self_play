@@ -134,7 +134,7 @@ class PufferDriveEnv:
         selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
         valid = (~self.agent_dead[selected_ids]) & received_mask
 
-        raw_observations = observations.copy()
+        raw_observations = observations
         offset = 0
         transitions = []
         for info in infos:
@@ -145,7 +145,10 @@ class PufferDriveEnv:
         for transition in transitions:
             count = transition["count"]
             indices = transition_rows[transition["indices"] + offset]
-            raw_observations[indices] = transition["observations"]
+            if indices.size:
+                if raw_observations is observations:
+                    raw_observations = observations.copy()
+                raw_observations[indices] = transition["observations"]
             offset += count
 
         if transitions and offset != len(transition_rows):
@@ -158,8 +161,11 @@ class PufferDriveEnv:
                 "Drive truncated without providing FastTD3 final observations"
             )
 
+        same_observations = raw_observations is observations
         observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
-        raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
+        raw_observations = observations if same_observations else torch.as_tensor(
+            raw_observations, device=self.device, dtype=torch.float
+        )
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
