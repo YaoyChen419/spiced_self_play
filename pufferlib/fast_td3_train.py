@@ -621,10 +621,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         torch._foreach_add_(tgt_ps, src_ps, alpha=tau)
 
     if args.compile:
-        import torch._inductor.config as inductor_config
-
-        # Masked replay batches vary in size; keep compilation without per-size capture.
-        inductor_config.triton.cudagraph_skip_dynamic_graphs = True
         # Keep the native batch-dependent distribution projection outside tracing.
         qnet_target.projection = torch.compiler.disable(qnet_target.projection)
         compile_mode = args.compile_mode
