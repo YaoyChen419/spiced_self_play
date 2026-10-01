@@ -626,7 +626,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     if args.compile:
         # Skip native projection frames while allowing target MLP forwards to compile.
         for module in (qnet_target, qnet_target.qnet1, qnet_target.qnet2):
-            module.projection = torch.compiler.disable(module.projection, recursive=False)
+            projection = torch.compiler.disable(
+                module.projection.__func__, recursive=False
+            )
+            module.projection = projection.__get__(module, type(module))
         compile_mode = args.compile_mode
         update_main = torch.compile(update_main, mode=compile_mode, dynamic=True)
         update_pol = torch.compile(update_pol, mode=compile_mode, dynamic=True)
