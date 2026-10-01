@@ -624,8 +624,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         torch._foreach_add_(tgt_ps, src_ps, alpha=tau)
 
     if args.compile:
-        # Keep the native batch-dependent distribution projection outside tracing.
-        qnet_target.projection = torch.compiler.disable(qnet_target.projection)
+        # Skip native projection frames while allowing target MLP forwards to compile.
+        for module in (qnet_target, qnet_target.qnet1, qnet_target.qnet2):
+            module.projection = torch.compiler.disable(module.projection, recursive=False)
         compile_mode = args.compile_mode
         update_main = torch.compile(update_main, mode=compile_mode, dynamic=True)
         update_pol = torch.compile(update_pol, mode=compile_mode, dynamic=True)
@@ -832,7 +833,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     for rb in ready_buffers
                 ], dim=0)
                 sample_valid = data.pop("_valid")
-                data = data[sample_valid]
+                sample_indices = sample_valid.nonzero(as_tuple=True)[0]
+                data = data[sample_indices]
                 if data.numel() == 0:
                     continue
                 data["observations"] = normalize_obs(data["observations"])
