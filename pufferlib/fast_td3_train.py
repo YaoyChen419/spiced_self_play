@@ -128,13 +128,15 @@ class PufferDriveEnv:
             (agent_ids.copy(), previous_obs, previous_actions)
             if transition_ready.any() else None
         )
+        received_mask = masks & transition_ready
+        received_count = int(np.count_nonzero(received_mask))
         received_mask = torch.as_tensor(
-            masks & transition_ready, device=self.device, dtype=torch.bool
+            received_mask, device=self.device, dtype=torch.bool
         )
         selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
         valid = (~self.agent_dead[selected_ids]) & received_mask
 
-        raw_observations = observations
+        raw_observations = observations.copy()
         offset = 0
         transitions = []
         for info in infos:
@@ -145,10 +147,7 @@ class PufferDriveEnv:
         for transition in transitions:
             count = transition["count"]
             indices = transition_rows[transition["indices"] + offset]
-            if indices.size:
-                if raw_observations is observations:
-                    raw_observations = observations.copy()
-                raw_observations[indices] = transition["observations"]
+            raw_observations[indices] = transition["observations"]
             offset += count
 
         if transitions and offset != len(transition_rows):
@@ -161,11 +160,8 @@ class PufferDriveEnv:
                 "Drive truncated without providing FastTD3 final observations"
             )
 
-        same_observations = raw_observations is observations
         observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
-        raw_observations = observations if same_observations else torch.as_tensor(
-            raw_observations, device=self.device, dtype=torch.float
-        )
+        raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
@@ -179,6 +175,7 @@ class PufferDriveEnv:
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
             "mask": received_mask,
+            "received_count": received_count,
             "valid": valid,
             "environment_infos": infos,
         }
@@ -755,8 +752,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             obs = next_obs
             continue
         truncations = infos["time_outs"]
-        received = int(infos["mask"].sum().item())
-        valid = int(infos["valid"].sum().item())
+        received = infos["received_count"]
+        valid = infos["valid"].sum()
         agent_steps += received
         interval_received += received
         interval_valid += valid
@@ -907,7 +904,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     "agent_steps": agent_steps,
                     "uptime": time.time() - run_start_time,
                     "environment/perc_transitions_used": (
-                        interval_valid / interval_received if interval_received else 0.0
+                        interval_valid.item() / interval_received if interval_received else 0.0
                     ),
                     "critic_lr": q_scheduler.get_last_lr()[0],
                     "actor_lr": actor_scheduler.get_last_lr()[0],
@@ -945,7 +942,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         "actor_lr": actor_scheduler.get_last_lr()[0],
     })
     if interval_received:
-        final_logs["environment/perc_transitions_used"] = interval_valid / interval_received
+        final_logs["environment/perc_transitions_used"] = interval_valid.item() / interval_received
     logger.log(final_logs, step=agent_steps)
     all_logs.append(final_logs)
     final_path = save_checkpoint()
