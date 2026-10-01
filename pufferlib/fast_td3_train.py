@@ -405,18 +405,24 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         eta_min=torch.tensor(args.actor_learning_rate_end, device=device),
     )
 
-    rb = SimpleReplayBuffer(
-        n_env=args.num_envs,
-        buffer_size=args.buffer_size,
-        n_obs=n_obs,
-        n_act=n_act,
-        n_critic_obs=n_critic_obs,
-        asymmetric_obs=envs.asymmetric_obs,
-        playground_mode=env_type == "mujoco_playground",
-        n_steps=args.num_steps,
-        gamma=args.gamma,
-        device=device,
-    )
+    # Each PufferLib worker owns continuous trajectories for its agent IDs.
+    num_workers = getattr(vecenv, "num_workers", 1)
+    agents_per_worker = vecenv.num_agents // num_workers
+    replay_buffers = [
+        SimpleReplayBuffer(
+            n_env=agents_per_worker,
+            buffer_size=args.buffer_size,
+            n_obs=n_obs,
+            n_act=n_act,
+            n_critic_obs=n_critic_obs,
+            asymmetric_obs=envs.asymmetric_obs,
+            playground_mode=env_type == "mujoco_playground",
+            n_steps=args.num_steps,
+            gamma=args.gamma,
+            device=device,
+        )
+        for _ in range(num_workers)
+    ]
 
     policy_noise = args.policy_noise
     noise_clip = args.noise_clip
@@ -587,8 +593,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     if args.compile:
         compile_mode = args.compile_mode
-        update_main = torch.compile(update_main, mode=compile_mode)
-        update_pol = torch.compile(update_pol, mode=compile_mode)
+        update_main = torch.compile(update_main, mode=compile_mode, dynamic=True)
+        update_pol = torch.compile(update_pol, mode=compile_mode, dynamic=True)
         policy = torch.compile(policy, mode=None)
         normalize_obs = torch.compile(obs_normalizer.forward, mode=None)
         normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None)
@@ -732,15 +738,41 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if envs.asymmetric_obs:
             transition["critic_observations"] = critic_obs
             transition["next"]["critic_observations"] = true_next_critic_obs
-        rb.extend(transition)
+        # Match SPiCED's handling of invalid/dead-agent transitions.
+        transition["next", "rewards"] = transition["next", "rewards"] * infos["valid"]
+        transition["next", "dones"] = transition["next", "dones"].masked_fill(
+            ~infos["valid"], 1
+        )
+        grouped_ids = previous[0].reshape(-1, agents_per_worker)
+        worker_ids = grouped_ids[:, 0] // agents_per_worker
+        expected_ids = worker_ids[:, None] * agents_per_worker + np.arange(agents_per_worker)
+        if not np.array_equal(grouped_ids, expected_ids):
+            raise RuntimeError("Replay requires complete, ordered PufferLib worker agent IDs")
+        for worker_id, worker_transition in zip(
+            worker_ids, transition.split(agents_per_worker)
+        ):
+            replay_buffers[worker_id].extend(worker_transition)
 
         obs = next_obs
         if envs.asymmetric_obs:
             critic_obs = next_critic_obs
 
         if global_step > args.learning_starts:
+            ready_buffers = [
+                replay_buffers[worker_id] for worker_id in worker_ids
+                if replay_buffers[worker_id].ptr >= args.num_steps
+            ]
             for i in range(args.num_updates):
-                data = rb.sample(max(1, args.batch_size // args.num_envs))
+                if not ready_buffers:
+                    break
+                data = torch.cat([
+                    rb.sample(max(1, args.batch_size // args.num_envs))
+                    for rb in ready_buffers
+                ], dim=0)
+                sample_valid = data.pop("_valid")
+                data = data[sample_valid]
+                if data.numel() == 0:
+                    continue
                 data["observations"] = normalize_obs(data["observations"])
                 data["next"]["observations"] = normalize_obs(
                     data["next"]["observations"]
@@ -774,7 +806,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 soft_update(qnet, qnet_target, args.tau)
 
             eval_due = next_eval_step is not None and agent_steps >= next_eval_step
-            if (global_step % 100 == 0 and start_time is not None) or eval_due:
+            if "actor_loss" in logs_dict and (
+                (global_step % 100 == 0 and start_time is not None) or eval_due
+            ):
                 now = time.time()
                 sps = (agent_steps - last_log_agent_steps) / (now - last_log_time)
                 pbar.set_description(f"{sps: 4.4f} sps, " + desc)
