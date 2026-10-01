@@ -714,7 +714,9 @@ class PuffeRL:
             self.msg = f"Checkpoint saved at update {self.epoch}"
 
             if self.config["eval"]["wosac_realism_eval"]:
-                pufferlib.utils.run_wosac_eval_in_subprocess(self.config, self.logger, self.global_step)
+                pufferlib.utils.run_wosac_eval_in_subprocess(
+                    self.config, self.logger, self.global_step, full_args=self.full_args
+                )
 
     def mean_and_log(self):
         config = self.config
@@ -1227,6 +1229,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
 
     if args["train"].get("agent") == "fasttd3":
+        if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+            raise pufferlib.APIUsageError("Native FastTD3 training does not implement DDP")
         from pufferlib.fast_td3_train import train as train_fast_td3
 
         return train_fast_td3(
@@ -1708,7 +1712,9 @@ def sanity(env_name, args=None):
 
 
 def profile(args=None, env_name=None, vecenv=None, policy=None):
-    args = load_config()
+    args = args or load_config(env_name)
+    if args["train"].get("agent") == "fasttd3":
+        raise pufferlib.APIUsageError("SPiCED profile requires the PPO trainer")
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv)
 
@@ -1729,6 +1735,8 @@ def profile(args=None, env_name=None, vecenv=None, policy=None):
 
 def export(args=None, env_name=None, vecenv=None, policy=None, path=None, silent=False):
     args = args or load_config(env_name)
+    if args["train"].get("agent") == "fasttd3":
+        raise pufferlib.APIUsageError("SPiCED C export does not support the FastTD3 network")
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv)
 
@@ -1774,11 +1782,7 @@ def _load_state_dict(checkpoint, device):
     return {k.replace("module.", ""): v for k, v in state_dict.items()}
 
 
-def load_fasttd3_policy(args, vecenv, env_name=""):
-    from pufferlib.fast_td3 import Actor
-    from pufferlib.fast_td3_utils import EmpiricalNormalization
-
-    device = args["train"]["device"]
+def resolve_fasttd3_checkpoint_path(args, env_name=""):
     load_path = args["load_model_path"]
     load_id = args["load_id"]
 
@@ -1807,6 +1811,16 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
         raise pufferlib.APIUsageError(
             "FastTD3 evaluation requires --load-model-path or --load-id"
         )
+
+    return load_path
+
+
+def load_fasttd3_policy(args, vecenv, env_name=""):
+    from pufferlib.fast_td3 import Actor
+    from pufferlib.fast_td3_utils import EmpiricalNormalization
+
+    device = args["train"]["device"]
+    load_path = resolve_fasttd3_checkpoint_path(args, env_name)
 
     checkpoint = torch.load(load_path, map_location=device, weights_only=False)
     checkpoint_args = checkpoint["args"]

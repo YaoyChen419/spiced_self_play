@@ -6,7 +6,7 @@ import subprocess
 import json
 
 
-def run_wosac_eval_in_subprocess(config, logger, global_step):
+def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
     """
     Run WOSAC evaluation in a subprocess and log metrics to wandb.
 
@@ -53,6 +53,27 @@ def run_wosac_eval_in_subprocess(config, logger, global_step):
             "--eval.wosac-sanity-check",
             str(eval_config.get("wosac_sanity_check", False)),
         ]
+
+        # Forward configured CLI options; retain the native subprocess/metric pipeline.
+        option_sections = {"eval": eval_config}
+        if full_args is not None:
+            option_sections["env"] = full_args["env"]
+            option_sections["train"] = {
+                key: full_args["train"][key]
+                for key in ("agent", "device") if key in full_args["train"]
+            }
+            cmd.extend(["--rnn-name", repr(full_args["rnn_name"])])
+        for section, options in option_sections.items():
+            for key, value in options.items():
+                if section == "env" and key in (
+                    "capture_final_observations", "uses_memory", "memory_size"
+                ):
+                    continue
+                flag = f"--{section}.{key}".replace("_", "-")
+                if flag not in cmd:
+                    if section == "train" and key == "device" and isinstance(value, int):
+                        value = f"cuda:{value}"
+                    cmd.extend([flag, repr(value)])
 
         if not model_files:
             print("No model files found for WOSAC evaluation. Running WOSAC with random policy.")

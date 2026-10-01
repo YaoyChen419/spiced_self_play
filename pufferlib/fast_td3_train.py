@@ -88,6 +88,7 @@ class PufferDriveEnv:
         self.num_obs = vecenv.single_observation_space.shape[0]
         self.num_actions = vecenv.single_action_space.shape[0]
         self.asymmetric_obs = False
+        self.agents_per_worker = vecenv.num_agents // getattr(vecenv, "num_workers", 1)
         self.agent_dead = torch.zeros(vecenv.num_agents, device=device, dtype=torch.bool)
         self.pending = {}
 
@@ -102,19 +103,36 @@ class PufferDriveEnv:
 
     def step(self, actions):
         actions = torch.clamp(actions.float(), -1.0, 1.0)
-        self.pending[int(self.agent_ids[0])] = (self.agent_ids, self.observations, actions)
+        for start in range(0, self.num_envs, self.agents_per_worker):
+            end = start + self.agents_per_worker
+            self.pending[int(self.agent_ids[start])] = (
+                self.agent_ids[start:end], self.observations[start:end], actions[start:end]
+            )
         self.vecenv.send(actions.detach().cpu().numpy())
         observations, rewards, terminals, truncations, infos, agent_ids, masks = self.vecenv.recv()
 
-        previous = self.pending.pop(int(agent_ids[0]), None)
-        if previous is not None and not np.array_equal(previous[0], agent_ids):
-            raise RuntimeError("PufferDrive agent IDs changed within an asynchronous batch")
-        selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
-        valid = (~self.agent_dead[selected_ids]) & torch.as_tensor(
-            masks, device=self.device, dtype=torch.bool
+        previous_obs = torch.zeros_like(self.observations)
+        previous_actions = torch.zeros_like(actions)
+        transition_ready = np.zeros(self.num_envs, dtype=bool)
+        for start in range(0, self.num_envs, self.agents_per_worker):
+            end = start + self.agents_per_worker
+            worker_previous = self.pending.pop(int(agent_ids[start]), None)
+            if worker_previous is None:
+                continue  # Initial observations have no preceding action.
+            if not np.array_equal(worker_previous[0], agent_ids[start:end]):
+                raise RuntimeError("PufferDrive agent IDs changed within a worker")
+            previous_obs[start:end] = worker_previous[1]
+            previous_actions[start:end] = worker_previous[2]
+            transition_ready[start:end] = True
+        previous = (
+            (agent_ids.copy(), previous_obs, previous_actions)
+            if transition_ready.any() else None
         )
-        if previous is None:
-            valid.zero_()
+        received_mask = torch.as_tensor(
+            masks & transition_ready, device=self.device, dtype=torch.bool
+        )
+        selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
+        valid = (~self.agent_dead[selected_ids]) & received_mask
 
         raw_observations = observations.copy()
         offset = 0
@@ -123,18 +141,19 @@ class PufferDriveEnv:
             if "_fasttd3_transition" in info:
                 transitions.append(info["_fasttd3_transition"])
 
+        transition_rows = np.flatnonzero(transition_ready)
         for transition in transitions:
             count = transition["count"]
-            indices = transition["indices"] + offset
+            indices = transition_rows[transition["indices"] + offset]
             raw_observations[indices] = transition["observations"]
             offset += count
 
-        if transitions and offset != len(observations):
+        if transitions and offset != len(transition_rows):
             raise RuntimeError(
                 f"FastTD3 final-observation metadata covers {offset} agents, "
-                f"but the received batch contains {len(observations)}"
+                f"but the received batch contains {len(transition_rows)} transitions"
             )
-        if np.any(truncations) and not transitions:
+        if np.any(truncations[transition_ready]) and not transitions:
             raise RuntimeError(
                 "Drive truncated without providing FastTD3 final observations"
             )
@@ -153,7 +172,7 @@ class PufferDriveEnv:
             "time_outs": truncations,
             "observations": {"raw": {"obs": raw_observations}},
             "transition": previous,
-            "mask": torch.as_tensor(masks, device=self.device, dtype=torch.bool),
+            "mask": received_mask,
             "valid": valid,
             "environment_infos": infos,
         }
@@ -167,6 +186,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         WandbLogger,
         load_config,
         load_env,
+        resolve_fasttd3_checkpoint_path,
     )
 
     full_args = args or load_config(env_name)
@@ -181,7 +201,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args.env_name = env_name
     args.cuda = cuda
     args.device_rank = device_rank
-    args.checkpoint_path = full_args.get("load_model_path")
+    args.checkpoint_path = (
+        resolve_fasttd3_checkpoint_path(full_args, env_name)
+        if full_args.get("load_model_path") or full_args.get("load_id") else None
+    )
     args.eval_interval_agent_steps = full_args.get("eval", {}).get("eval_interval_agent_steps", 0)
     args.save_interval = train_config["checkpoint_interval"]
 
@@ -195,6 +218,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     vecenv = vecenv or load_env(env_name, full_args)
     args.num_envs = vecenv.observation_space.shape[0]
+    args.save_interval_agent_steps = args.save_interval * args.num_envs
     total_agent_timesteps = args.total_timesteps
     args.total_timesteps = math.ceil(total_agent_timesteps / args.num_envs)
 
@@ -365,7 +389,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     else:
         raise ValueError(f"Agent {args.agent} not supported")
 
-    actor = actor_cls(**actor_kwargs)
+    if isinstance(policy, tuple):
+        policy, obs_normalizer = policy
+        obs_normalizer = obs_normalizer.to(device)
+    if policy is not None and not isinstance(policy, actor_cls):
+        raise pufferlib.APIUsageError("FastTD3 training requires a native FastTD3 actor")
+    actor = policy.to(device) if policy is not None else actor_cls(**actor_kwargs)
 
     if env_type in ["mtbench"]:
         # Python 3.8 doesn't support 'from_module' in tensordict
@@ -642,6 +671,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         (agent_steps // args.eval_interval_agent_steps + 1) * args.eval_interval_agent_steps
         if args.eval_interval_agent_steps > 0 else None
     )
+    next_checkpoint_step = (
+        (agent_steps // args.save_interval_agent_steps + 1) * args.save_interval_agent_steps
+        if args.save_interval_agent_steps > 0 else None
+    )
     dones = None
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     run_start_time = time.time()
@@ -650,6 +683,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     last_log_agent_steps = agent_steps
     interval_received = 0
     interval_valid = 0
+    last_eval_agent_steps = None
     environment_stats = defaultdict(list)
     desc = ""
     all_logs = []
@@ -658,7 +692,30 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     def checkpoint_path(step):
         return os.path.join(model_dir, f"model_{env_name}_{step:06d}.pt")
 
-    while global_step < args.total_timesteps:
+    def save_checkpoint():
+        model_path = checkpoint_path(global_step)
+        save_params(
+            global_step, actor, qnet, qnet_target,
+            obs_normalizer, critic_obs_normalizer, args, model_path,
+            agent_steps=agent_steps, full_args=full_args,
+        )
+        # Reuse SPiCED's periodic checkpoint artifact upload.
+        if isinstance(logger, WandbLogger):
+            artifact = wandb.Artifact(
+                f"checkpoint-{logger.run_id}-epoch{global_step:06d}",
+                type="checkpoint",
+                metadata={"epoch": global_step, "global_step": agent_steps},
+            )
+            artifact.add_file(model_path)
+            logger.wandb.run.log_artifact(artifact)
+        if full_args["eval"]["wosac_realism_eval"]:
+            pufferlib.utils.run_wosac_eval_in_subprocess(
+                dict(**train_config, env=env_name, eval=full_args["eval"]),
+                logger, agent_steps, full_args=full_args,
+            )
+        return model_path
+
+    while agent_steps < total_agent_timesteps:
         mark_step()
         logs_dict = TensorDict()
         if (
@@ -828,6 +885,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     if eval_due:
                         print(f"Evaluating at agent step {agent_steps}")
                         logs.update(evaluate())
+                        last_eval_agent_steps = agent_steps
                         next_eval_step = (
                             agent_steps // args.eval_interval_agent_steps + 1
                         ) * args.eval_interval_agent_steps
@@ -850,41 +908,35 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 last_log_time = now
                 last_log_agent_steps = agent_steps
 
-            if (
-                args.save_interval > 0
-                and global_step > 0
-                and global_step % args.save_interval == 0
-            ):
-                print(f"Saving model at global step {global_step}")
-                save_params(
-                    global_step,
-                    actor,
-                    qnet,
-                    qnet_target,
-                    obs_normalizer,
-                    critic_obs_normalizer,
-                    args,
-                    checkpoint_path(global_step),
-                    agent_steps=agent_steps,
-                )
+            if next_checkpoint_step is not None and agent_steps >= next_checkpoint_step:
+                print(f"Saving model at agent step {agent_steps}")
+                save_checkpoint()
+                next_checkpoint_step = (
+                    agent_steps // args.save_interval_agent_steps + 1
+                ) * args.save_interval_agent_steps
 
         global_step += 1
         actor_scheduler.step()
         q_scheduler.step()
         pbar.update(1)
 
-    final_path = checkpoint_path(global_step)
-    save_params(
-        global_step,
-        actor,
-        qnet,
-        qnet_target,
-        obs_normalizer,
-        critic_obs_normalizer,
-        args,
-        final_path,
-        agent_steps=agent_steps,
-    )
+    final_logs = _mean_environment_stats(environment_stats)
+    with torch.no_grad():
+        if last_eval_agent_steps != agent_steps:
+            final_logs.update(evaluate())
+    now = time.time()
+    final_logs.update({
+        "SPS": (agent_steps - last_log_agent_steps) / (now - last_log_time),
+        "agent_steps": agent_steps,
+        "uptime": now - run_start_time,
+        "critic_lr": q_scheduler.get_last_lr()[0],
+        "actor_lr": actor_scheduler.get_last_lr()[0],
+    })
+    if interval_received:
+        final_logs["environment/perc_transitions_used"] = interval_valid / interval_received
+    logger.log(final_logs, step=agent_steps)
+    all_logs.append(final_logs)
+    final_path = save_checkpoint()
     vecenv.close()
     logger.close(final_path)
     return all_logs

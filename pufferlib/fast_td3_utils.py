@@ -768,6 +768,7 @@ def save_params(
     args,
     save_path,
     agent_steps=None,
+    full_args=None,
 ):
     """Save model parameters and training configuration to disk."""
 
@@ -796,6 +797,8 @@ def save_params(
         "global_step": global_step,
         "agent_steps": agent_steps,
     }
+    if full_args is not None:
+        save_dict["full_args"] = full_args
     torch.save(save_dict, save_path, _use_new_zipfile_serialization=True)
     print(f"Saved parameters and configuration to {save_path}")
 

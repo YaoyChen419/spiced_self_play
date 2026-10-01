@@ -868,6 +868,8 @@ class Evaluator:
 
     def _unpack_eval_configs(self, configs):
         eval_config = copy.deepcopy(configs)
+        # Final-observation metadata is only needed by the training replay adapter.
+        eval_config["env"]["capture_final_observations"] = False
         # Create separate evaluation environments based on specified configs
         eval_config["env"]["termination_mode"] = 1  # Important to ensure correct statistics
         backend = eval_config["eval"].get("backend", "PufferEnv")
@@ -1003,7 +1005,11 @@ class Evaluator:
 
         info_list = []
         for time_idx in range(self.sim_steps):
-            if mode == "human_replay" and not terminals[render_env_idx]:
+            if (
+                mode == "human_replay"
+                and render_env_idx is not None
+                and not terminals[render_env_idx]
+            ):
                 driver.render(view_mode=view_mode, env_idx=render_env_idx)
             elif mode == "self_play" and render_env_idx is not None:
                 driver.render(view_mode=view_mode, env_idx=render_env_idx)
