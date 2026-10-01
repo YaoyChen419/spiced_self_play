@@ -621,15 +621,19 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         torch._foreach_add_(tgt_ps, src_ps, alpha=tau)
 
     if args.compile:
+        import torch._inductor.config as inductor_config
+
+        # Masked replay batches vary in size; keep compilation without per-size capture.
+        inductor_config.triton.cudagraph_skip_dynamic_graphs = True
         compile_mode = args.compile_mode
         update_main = torch.compile(update_main, mode=compile_mode, dynamic=True)
         update_pol = torch.compile(update_pol, mode=compile_mode, dynamic=True)
         policy = torch.compile(policy, mode=None)
-        normalize_obs = torch.compile(obs_normalizer.forward, mode=None)
-        normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None)
+        normalize_obs = torch.compile(obs_normalizer.forward, mode=None, dynamic=True)
+        normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None, dynamic=True)
         if args.reward_normalization:
             update_stats = torch.compile(reward_normalizer.update_stats, mode=None)
-        normalize_reward = torch.compile(reward_normalizer.forward, mode=None)
+        normalize_reward = torch.compile(reward_normalizer.forward, mode=None, dynamic=True)
     else:
         normalize_obs = obs_normalizer.forward
         normalize_critic_obs = critic_obs_normalizer.forward
@@ -851,6 +855,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     )
                 else:
                     data["next"]["rewards"] = normalize_reward(raw_rewards)
+
+                if args.compile:
+                    # Expose tensor batch dimensions without TensorDict batch-size metadata.
+                    for tensor in data.values(include_nested=True, leaves_only=True):
+                        if tensor.shape[0] > 1:
+                            torch._dynamo.mark_dynamic(tensor, 0)
+                    data = data.to_dict()
 
                 logs_dict = update_main(data, logs_dict)
                 if args.num_updates > 1:
