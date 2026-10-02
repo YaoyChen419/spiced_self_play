@@ -22,6 +22,7 @@ class SimpleReplayBuffer(nn.Module):
         n_steps: int = 1,
         gamma: float = 0.99,
         device=None,
+        valid_device=None,
     ):
         """
         A simple replay buffer that stores transitions in a circular buffer.
@@ -85,12 +86,18 @@ class SimpleReplayBuffer(nn.Module):
                     (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
                 )
         self.ptr = 0
-        self.valid = torch.ones((n_env, buffer_size), device=device, dtype=torch.bool)
+        # Host-side validity/indices avoid CUDA nonzero synchronization for one-step replay.
+        self.valid = torch.ones(
+            (n_env, buffer_size),
+            device=valid_device if n_steps == 1 and valid_device is not None else device,
+            dtype=torch.bool,
+        )
 
     @torch.no_grad()
     def extend(
         self,
         tensor_dict: TensorDict,
+        valid: Optional[torch.Tensor] = None,
     ):
         observations = tensor_dict["observations"]
         actions = tensor_dict["actions"]
@@ -100,7 +107,7 @@ class SimpleReplayBuffer(nn.Module):
         next_observations = tensor_dict["next"]["observations"]
 
         ptr = self.ptr % self.buffer_size
-        self.valid[:, ptr] = tensor_dict.get("valid", True)
+        self.valid[:, ptr] = tensor_dict.get("valid", True) if valid is None else valid
         self.observations[:, ptr] = observations
         self.actions[:, ptr] = actions
         self.rewards[:, ptr] = rewards
@@ -128,12 +135,13 @@ class SimpleReplayBuffer(nn.Module):
         # we will sample n_env * batch_size transitions
 
         if self.n_steps == 1:
-            indices = torch.randint(
+            valid_indices = torch.randint(
                 0,
                 min(self.buffer_size, self.ptr),
                 (self.n_env, batch_size),
-                device=self.device,
+                device=self.valid.device,
             )
+            indices = valid_indices.to(self.observations.device, non_blocking=True)
             obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
             observations = torch.gather(self.observations, 1, obs_indices).reshape(
@@ -391,7 +399,7 @@ class SimpleReplayBuffer(nn.Module):
             },
             batch_size=self.n_env * batch_size,
         )
-        valid = self.valid.gather(1, indices)
+        valid = self.valid.gather(1, valid_indices if self.n_steps == 1 else indices)
         if self.n_steps > 1:
             valid = valid & self.valid.gather(1, final_next_obs_indices)
         out["_valid"] = valid.reshape(self.n_env * batch_size)

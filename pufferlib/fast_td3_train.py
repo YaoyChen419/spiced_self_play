@@ -89,7 +89,7 @@ class PufferDriveEnv:
         self.num_actions = vecenv.single_action_space.shape[0]
         self.asymmetric_obs = False
         self.agents_per_worker = vecenv.num_agents // getattr(vecenv, "num_workers", 1)
-        self.agent_dead = torch.zeros(vecenv.num_agents, device=device, dtype=torch.bool)
+        self.agent_dead = np.zeros(vecenv.num_agents, dtype=bool)
         self.pending = {}
 
     def reset(self):
@@ -97,7 +97,7 @@ class PufferDriveEnv:
         observations, _, _, _, _, agent_ids, _ = self.vecenv.recv()
         self.agent_ids = agent_ids.copy()
         self.pending.clear()
-        self.agent_dead.zero_()
+        self.agent_dead.fill(False)
         self.observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
         return self.observations
 
@@ -130,11 +130,11 @@ class PufferDriveEnv:
         )
         received_mask = masks & transition_ready
         received_count = int(np.count_nonzero(received_mask))
+        valid_cpu = (~self.agent_dead[agent_ids]) & received_mask
         received_mask = torch.as_tensor(
             received_mask, device=self.device, dtype=torch.bool
         )
-        selected_ids = torch.as_tensor(agent_ids, device=self.device, dtype=torch.long)
-        valid = (~self.agent_dead[selected_ids]) & received_mask
+        valid = torch.as_tensor(valid_cpu, device=self.device, dtype=torch.bool)
 
         raw_observations = observations.copy()
         offset = 0
@@ -160,14 +160,15 @@ class PufferDriveEnv:
                 "Drive truncated without providing FastTD3 final observations"
             )
 
+        # Keep validity on the host, where the environment already produces done flags.
+        self.agent_dead[agent_ids] |= terminals & ~truncations
+        self.agent_dead[agent_ids] &= ~truncations
         observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
         raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         dones = terminals | truncations
-        self.agent_dead[selected_ids] |= terminals & ~truncations
-        self.agent_dead[selected_ids] &= ~truncations
         self.agent_ids = agent_ids.copy()
         self.observations = observations
         info = {
@@ -177,6 +178,7 @@ class PufferDriveEnv:
             "mask": received_mask,
             "received_count": received_count,
             "valid": valid,
+            "valid_cpu": valid_cpu,
             "environment_infos": infos,
         }
         return observations, rewards, dones, info
@@ -452,6 +454,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             n_steps=args.num_steps,
             gamma=args.gamma,
             device=device,
+            valid_device="cpu",
         )
         for _ in range(num_workers)
     ]
@@ -740,9 +743,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         ):
             current_ids = torch.as_tensor(envs.agent_ids, device=device, dtype=torch.long)
             if args.obs_normalization:
-                active = ~envs.agent_dead[current_ids]
-                if bool(active.any()):
-                    obs_normalizer.update(obs[active])
+                active_indices = np.flatnonzero(~envs.agent_dead[envs.agent_ids])
+                if active_indices.size:
+                    active_indices = torch.as_tensor(active_indices, device=device)
+                    obs_normalizer.update(obs[active_indices])
                 norm_obs = normalize_obs(obs, update=False)
             else:
                 norm_obs = normalize_obs(obs)
@@ -814,10 +818,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         expected_ids = worker_ids[:, None] * agents_per_worker + np.arange(agents_per_worker)
         if not np.array_equal(grouped_ids, expected_ids):
             raise RuntimeError("Replay requires complete, ordered PufferLib worker agent IDs")
-        for worker_id, worker_transition in zip(
-            worker_ids, transition.split(agents_per_worker)
+        for worker_id, worker_transition, worker_valid in zip(
+            worker_ids, transition.split(agents_per_worker),
+            infos["valid_cpu"].reshape(-1, agents_per_worker),
         ):
-            replay_buffers[worker_id].extend(worker_transition)
+            replay_buffers[worker_id].extend(
+                worker_transition, valid=torch.from_numpy(worker_valid)
+            )
 
         obs = next_obs
         if envs.asymmetric_obs:
@@ -837,7 +844,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 ], dim=0)
                 sample_valid = data.pop("_valid")
                 sample_indices = sample_valid.nonzero(as_tuple=True)[0]
-                data = data[sample_indices]
+                data = data[sample_indices.to(device, non_blocking=True)]
                 if data.numel() == 0:
                     continue
                 data["observations"] = normalize_obs(data["observations"])
