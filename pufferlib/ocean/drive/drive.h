@@ -313,6 +313,7 @@ struct Entity {
     float goals_sampled_this_episode;
     int current_goal_reached;
     int active_agent;
+    int controlled_idx; // Row in policy buffers; -1 for background entities.
     int controller;
     int stopped;
     int removed;
@@ -599,7 +600,7 @@ struct Drive {
     IDMAgentState *idm_agent_states;
 };
 
-static void capture_final_observation(Drive *env, int agent_idx);
+static void capture_final_observation(Drive *env, int i);
 static void idm_load_extension(FILE *file, Drive *env);
 static void idm_shift_map(Drive *env, float mean_x, float mean_y);
 static void idm_free(Drive *env);
@@ -732,6 +733,7 @@ Entity *load_map_binary(const char *filename, Drive *env) {
 
     for (int i = 0; i < env->num_entities; i++) {
         // Read base entity data
+        entities[i].controlled_idx = -1;
         fread(&entities[i].scenario_id, sizeof(int), 1, file);
         fread(&entities[i].type, sizeof(int), 1, file);
         fread(&entities[i].id, sizeof(int), 1, file);
@@ -1477,8 +1479,8 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             agent->vx = agent->vy = 0.0f;
         } else if (env->collision_behavior == REMOVE_AGENT && !agent->removed) {
             Entity *agent_collided = &env->entities[car_collided_with_index];
-            capture_final_observation(env, agent_idx);
-            capture_final_observation(env, car_collided_with_index);
+            capture_final_observation(env, agent->controlled_idx);
+            capture_final_observation(env, agent_collided->controlled_idx);
             agent->removed = 1;
             agent_collided->removed = 1;
             agent->x = agent->y = -10000.0f;
@@ -1491,7 +1493,7 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             agent->stopped = 1;
             agent->vx = agent->vy = 0.0f;
         } else if (env->offroad_behavior == REMOVE_AGENT && !agent->removed) {
-            capture_final_observation(env, agent_idx);
+            capture_final_observation(env, agent->controlled_idx);
             agent->removed = 1;
             agent->x = agent->y = -10000.0f;
         }
@@ -1680,6 +1682,7 @@ void set_active_agents(Drive *env) {
     env->expert_static_agent_indices = (int *)malloc(env->expert_static_agent_count * sizeof(int));
     for (int i = 0; i < env->active_agent_count; i++) {
         env->active_agent_indices[i] = active_agent_indices[i];
+        env->entities[active_agent_indices[i]].controlled_idx = i;
     };
     for (int i = 0; i < env->static_agent_count; i++) {
         env->static_agent_indices[i] = static_agent_indices[i];
@@ -2412,21 +2415,15 @@ void compute_observations(Drive *env) {
     compute_observations_range(env, 0, env->active_agent_count);
 }
 
-static void capture_final_observation(Drive *env, int agent_idx) {
-    if (!env->final_observations)
+static void capture_final_observation(Drive *env, int i) {
+    if (!env->final_observations || i < 0)
         return;
-    for (int i = 0; i < env->active_agent_count; i++) {
-        if (env->active_agent_indices[i] == agent_idx) {
-            env->terminals[i] = 1;
-            compute_observations_range(env, i, i + 1);
-            int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
-            int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
-                          ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
-            memcpy(env->final_observations + i * obs_dim, env->observations + i * obs_dim,
-                   obs_dim * sizeof(float));
-            return;
-        }
-    }
+    compute_observations_range(env, i, i + 1);
+    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
+    int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
+                  ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    memcpy(env->final_observations + i * obs_dim, env->observations + i * obs_dim,
+           obs_dim * sizeof(float));
 }
 
 void sample_new_goal(Drive *env, int agent_idx) {
@@ -2790,13 +2787,14 @@ void c_step(Drive *env) {
         }
     }
 
-    // Capture only newly completed agents, before removal changes their physical state.
-    if (env->final_observations && env->goal_behavior == GOAL_REMOVE) {
+    // Finalize removal signals after rewards; capture goal observations before removal.
+    if (env->final_observations) {
         for (int i = 0; i < env->active_agent_count; i++) {
-            int agent_idx = env->active_agent_indices[i];
-            Entity *agent = &env->entities[agent_idx];
-            if (agent->current_goal_reached && !agent->removed)
-                capture_final_observation(env, agent_idx);
+            Entity *agent = &env->entities[env->active_agent_indices[i]];
+            if (agent->removed)
+                env->terminals[i] = 1;
+            else if (env->goal_behavior == GOAL_REMOVE && agent->current_goal_reached)
+                capture_final_observation(env, i);
         }
     }
 

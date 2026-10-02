@@ -242,10 +242,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     vecenv = vecenv or load_env(env_name, full_args)
     args.num_envs = vecenv.observation_space.shape[0]
-    if args.reward_normalization and vecenv.num_agents != args.num_envs:
-        raise pufferlib.APIUsageError(
-            "Reward normalization requires fixed agent rows; asynchronous worker batches are unsupported"
-        )
     args.save_interval_agent_steps = args.save_interval * args.num_envs
     total_agent_timesteps = args.total_timesteps
     args.total_timesteps = math.ceil(total_agent_timesteps / args.num_envs)
@@ -315,6 +311,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 gamma=args.gamma,
                 device=device,
                 g_max=min(abs(args.v_min), abs(args.v_max)),
+                num_envs=vecenv.num_agents,
             )
     else:
         reward_normalizer = nn.Identity()
@@ -680,7 +677,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         normalize_obs = torch.compile(obs_normalizer.forward, mode=None, dynamic=True)
         normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None, dynamic=True)
         if args.reward_normalization:
-            update_stats = torch.compile(reward_normalizer.update_stats, mode=None)
+            update_stats = torch.compile(reward_normalizer.update_stats, mode=None, dynamic=True)
         normalize_reward = torch.compile(reward_normalizer.forward, mode=None, dynamic=True)
     else:
         normalize_obs = obs_normalizer.forward
@@ -711,15 +708,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         )
         qnet.load_state_dict(torch_checkpoint["qnet_state_dict"])
         qnet_target.load_state_dict(torch_checkpoint["qnet_target_state_dict"])
-        training_state = torch_checkpoint.get("training_state")
-        if training_state is not None:
-            actor_optimizer.load_state_dict(training_state["actor_optimizer"])
-            q_optimizer.load_state_dict(training_state["q_optimizer"])
-            actor_scheduler.load_state_dict(training_state["actor_scheduler"])
-            q_scheduler.load_state_dict(training_state["q_scheduler"])
-            scaler.load_state_dict(training_state["scaler"])
-        else:
-            print("Checkpoint has no optimizer state; AdamW restarts with fresh moments.")
         global_step = torch_checkpoint["global_step"]
         agent_steps = torch_checkpoint.get(
             "agent_steps", global_step * args.num_envs
@@ -759,13 +747,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             global_step, actor, qnet, qnet_target,
             obs_normalizer, critic_obs_normalizer, args, model_path,
             agent_steps=agent_steps, full_args=full_args,
-            training_state={
-                "actor_optimizer": actor_optimizer.state_dict(),
-                "q_optimizer": q_optimizer.state_dict(),
-                "actor_scheduler": actor_scheduler.state_dict(),
-                "q_scheduler": q_scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-            },
         )
         # Reuse SPiCED's periodic checkpoint artifact upload.
         if isinstance(logger, WandbLogger):
@@ -825,13 +806,18 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         interval_valid += valid
         _collect_environment_stats(environment_stats, infos["environment_infos"])
 
-        if args.reward_normalization:
+        if args.reward_normalization and valid:
             if env_type == "mtbench":
                 task_ids_one_hot = obs[..., -envs.num_tasks :]
                 task_indices = torch.argmax(task_ids_one_hot, dim=1)
                 update_stats(rewards, dones.float(), task_ids=task_indices)
             else:
-                update_stats(rewards, dones.float())
+                reward_ids = torch.as_tensor(previous[0], device=device, dtype=torch.long)
+                if valid == args.num_envs:
+                    update_stats(rewards, dones.float(), env_ids=reward_ids)
+                else:
+                    rows = torch.as_tensor(np.flatnonzero(infos["valid_cpu"]), device=device)
+                    update_stats(rewards[rows], dones[rows].float(), env_ids=reward_ids[rows])
 
         if envs.asymmetric_obs:
             next_critic_obs = infos["observations"]["critic"]

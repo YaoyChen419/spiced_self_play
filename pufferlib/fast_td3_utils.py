@@ -542,10 +542,11 @@ class RewardNormalizer(nn.Module):
         device: torch.device,
         g_max: float = 10.0,
         epsilon: float = 1e-8,
+        num_envs: Optional[int] = None,
     ):
         super().__init__()
         self.register_buffer(
-            "G", torch.zeros(1, device=device)
+            "G", torch.zeros(1 if num_envs is None else num_envs, device=device)
         )  # running estimate of the discounted return
         self.register_buffer("G_r_max", torch.zeros(1, device=device))  # running-max
         self.G_rms = EmpiricalNormalization(shape=1, device=device)
@@ -564,16 +565,22 @@ class RewardNormalizer(nn.Module):
         self,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        env_ids: Optional[torch.Tensor] = None,
     ):
-        self.G = self.gamma * (1 - dones) * self.G + rewards
-        self.G_rms.update(self.G.view(-1, 1))
+        previous = self.G if env_ids is None else self.G[env_ids]
+        returns = self.gamma * (1 - dones) * previous + rewards
+        if env_ids is None:
+            self.G = returns
+        else:
+            self.G.index_copy_(0, env_ids, returns)
+        self.G_rms.update(returns.view(-1, 1))
 
-        local_max = torch.max(torch.abs(self.G))
+        local_max = torch.max(torch.abs(returns))
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
 
-        self.G_r_max = max(self.G_r_max, local_max)
+        self.G_r_max.copy_(torch.maximum(self.G_r_max, local_max))
 
     def forward(self, rewards: torch.Tensor) -> torch.Tensor:
         return self._scale_reward(rewards)
@@ -801,7 +808,6 @@ def save_params(
     save_path,
     agent_steps=None,
     full_args=None,
-    training_state=None,
 ):
     """Save model parameters and training configuration to disk."""
 
@@ -832,8 +838,6 @@ def save_params(
     }
     if full_args is not None:
         save_dict["full_args"] = full_args
-    if training_state is not None:
-        save_dict["training_state"] = training_state
     torch.save(save_dict, save_path, _use_new_zipfile_serialization=True)
     print(f"Saved parameters and configuration to {save_path}")
 
