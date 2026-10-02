@@ -1425,7 +1425,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             frame_count = 0
 
         while True:
-            driver.render(env_id=0)
+            driver.render(env_idx=0)
 
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
