@@ -47,22 +47,20 @@ class SimpleReplayBuffer(nn.Module):
         self.n_steps = n_steps
         self.device = device
 
-        self.observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
-        )
-        self.actions = torch.zeros(
-            (n_env, buffer_size, n_act), device=device, dtype=torch.float
-        )
-        self.rewards = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.float
-        )
-        self.dones = torch.zeros((n_env, buffer_size), device=device, dtype=torch.long)
-        self.truncations = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.long
-        )
-        self.next_observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
-        )
+        time_major = n_steps == 1 and not asymmetric_obs
+
+        def allocate(*shape, dtype=torch.float):
+            # SB3's [time, env, ...] layout makes each collected step contiguous.
+            leading = (buffer_size, n_env) if time_major else (n_env, buffer_size)
+            storage = torch.zeros((*leading, *shape), device=device, dtype=dtype)
+            return storage.transpose(0, 1) if time_major else storage
+
+        self.observations = allocate(n_obs)
+        self.actions = allocate(n_act)
+        self.rewards = allocate()
+        self.dones = allocate(dtype=torch.long)
+        self.truncations = allocate(dtype=torch.long)
+        self.next_observations = allocate(n_obs)
         if asymmetric_obs:
             if self.playground_mode:
                 # Only store the privileged part of observations (n_critic_obs - n_obs)
@@ -149,7 +147,7 @@ class SimpleReplayBuffer(nn.Module):
                 # Select valid slots before reading large tensors, as in SB3 replay.
                 valid = self.valid.gather(1, valid_indices)
                 rows = torch.arange(self.n_env, device=self.valid.device)[:, None]
-                flat_indices = (rows * self.buffer_size + valid_indices)[valid]
+                flat_indices = (valid_indices * self.n_env + rows)[valid]
                 out = out[:flat_indices.numel()]
                 if flat_indices.numel() == 0:
                     return out
@@ -163,7 +161,7 @@ class SimpleReplayBuffer(nn.Module):
                     (("next", "truncations"), self.truncations),
                 ):
                     torch.index_select(
-                        storage.flatten(0, 1), 0, flat_indices, out=out[key]
+                        storage.transpose(0, 1).flatten(0, 1), 0, flat_indices, out=out[key]
                     )
                 out["next", "effective_n_steps"].fill_(1)
                 return out

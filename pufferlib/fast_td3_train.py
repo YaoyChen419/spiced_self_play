@@ -434,11 +434,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         list(qnet.parameters()),
         lr=torch.tensor(args.critic_learning_rate, device=device),
         weight_decay=args.weight_decay,
+        fused=device.type == "cuda",
     )
     actor_optimizer = optim.AdamW(
         list(actor.parameters()),
         lr=torch.tensor(args.actor_learning_rate, device=device),
         weight_decay=args.weight_decay,
+        fused=device.type == "cuda",
     )
 
     # Add learning rate schedulers
@@ -553,12 +555,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 -noise_clip, noise_clip
             )
 
-            next_state_actions = (actor(next_observations) + clipped_noise).clamp(
-                action_low, action_high
-            )
-            discount = args.gamma ** data["next"]["effective_n_steps"]
-
             with torch.no_grad():
+                next_state_actions = (actor(next_observations) + clipped_noise).clamp(
+                    action_low, action_high
+                )
+                discount = args.gamma ** data["next"]["effective_n_steps"]
                 qf1_next_target_projected, qf2_next_target_projected = (
                     qnet_target.projection(
                         next_critic_observations,
@@ -774,7 +775,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             current_ids = torch.as_tensor(envs.agent_ids, device=device, dtype=torch.long)
             if args.obs_normalization:
                 active_indices = np.flatnonzero(~envs.agent_dead[envs.agent_ids])
-                if active_indices.size:
+                if active_indices.size == obs.shape[0]:
+                    obs_normalizer.update(obs)
+                elif active_indices.size:
                     active_indices = torch.as_tensor(active_indices, device=device)
                     obs_normalizer.update(obs[active_indices])
                 norm_obs = normalize_obs(obs, update=False)
@@ -791,7 +794,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             continue
         truncations = infos["time_outs"]
         received = infos["received_count"]
-        valid = infos["valid"].sum()
+        valid = int(np.count_nonzero(infos["valid_cpu"]))
         agent_steps += received
         interval_received += received
         interval_valid += valid
@@ -961,7 +964,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     "agent_steps": agent_steps,
                     "uptime": time.time() - run_start_time,
                     "environment/perc_transitions_used": (
-                        interval_valid.item() / interval_received if interval_received else 0.0
+                        interval_valid / interval_received if interval_received else 0.0
                     ),
                     "critic_lr": q_scheduler.get_last_lr()[0],
                     "actor_lr": actor_scheduler.get_last_lr()[0],
@@ -993,7 +996,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         "actor_lr": actor_scheduler.get_last_lr()[0],
     })
     if interval_received:
-        final_logs["environment/perc_transitions_used"] = interval_valid.item() / interval_received
+        final_logs["environment/perc_transitions_used"] = interval_valid / interval_received
     logger.log(final_logs, step=agent_steps)
     all_logs.append(final_logs)
     vecenv.close()
