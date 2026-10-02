@@ -136,25 +136,28 @@ class PufferDriveEnv:
         )
         valid = torch.as_tensor(valid_cpu, device=self.device, dtype=torch.bool)
 
-        raw_observations = observations.copy()
+        final_rows, final_observations = [], []
+        offset = 0
         transitions = []
         for info in infos:
             if "_fasttd3_transition" in info:
                 transitions.append(info["_fasttd3_transition"])
 
-        truncated_rows = np.flatnonzero(truncations & transition_ready)
-        if transitions:
-            # Vector infos and agent rows share the same worker/environment order.
-            final_obs = np.concatenate(
-                [transition["observations"] for transition in transitions], axis=0
+        transition_rows = np.flatnonzero(transition_ready)
+        for transition in transitions:
+            count = transition["count"]
+            indices = transition_rows[transition["indices"] + offset]
+            if indices.size:
+                final_rows.append(indices)
+                final_observations.append(transition["observations"])
+            offset += count
+
+        if transitions and offset != len(transition_rows):
+            raise RuntimeError(
+                f"FastTD3 final-observation metadata covers {offset} agents, "
+                f"but the received batch contains {len(transition_rows)} transitions"
             )
-            if len(final_obs) != len(truncated_rows):
-                raise RuntimeError(
-                    f"FastTD3 final-observation metadata covers {len(final_obs)} agents, "
-                    f"but the received batch contains {len(truncated_rows)} truncations"
-                )
-            raw_observations[truncated_rows] = final_obs
-        elif truncated_rows.size:
+        if np.any(truncations[transition_ready]) and not transitions:
             raise RuntimeError(
                 "Drive truncated without providing FastTD3 final observations"
             )
@@ -162,8 +165,20 @@ class PufferDriveEnv:
         # Keep validity on the host, where the environment already produces done flags.
         self.agent_dead[agent_ids] |= terminals & ~truncations
         self.agent_dead[agent_ids] &= ~truncations
-        observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
-        raw_observations = torch.as_tensor(raw_observations, device=self.device, dtype=torch.float)
+        # recv buffers stay unchanged until the next send; CUDA conversion is blocking.
+        observations = torch.as_tensor(observations, device=self.device, dtype=torch.float)
+        if observations.device.type == "cpu":
+            observations = observations.clone()
+        raw_observations = observations
+        if final_rows:
+            raw_observations = observations.clone()
+            raw_observations.index_copy_(
+                0,
+                torch.as_tensor(np.concatenate(final_rows), device=self.device),
+                torch.as_tensor(
+                    np.concatenate(final_observations), device=self.device, dtype=torch.float
+                ),
+            )
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         terminals = torch.as_tensor(terminals.copy(), device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
@@ -457,6 +472,22 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         )
         for _ in range(num_workers)
     ]
+
+    samples_per_agent = max(1, args.batch_size // args.num_envs)
+    replay_batch = None
+    if args.num_steps == 1 and not envs.asymmetric_obs:
+        capacity = args.num_envs * samples_per_agent
+        replay_batch = TensorDict({
+            "observations": torch.empty(capacity, n_obs, device=device),
+            "actions": torch.empty(capacity, n_act, device=device),
+            "next": {
+                "observations": torch.empty(capacity, n_obs, device=device),
+                "rewards": torch.empty(capacity, device=device),
+                "dones": torch.empty(capacity, device=device, dtype=torch.long),
+                "truncations": torch.empty(capacity, device=device, dtype=torch.long),
+                "effective_n_steps": torch.empty(capacity, device=device, dtype=torch.long),
+            },
+        }, batch_size=[capacity], device=device)
 
     policy_noise = args.policy_noise
     noise_clip = args.noise_clip
@@ -777,9 +808,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if envs.asymmetric_obs:
             next_critic_obs = infos["observations"]["critic"]
         # Compute 'true' next_obs and next_critic_obs for saving
-        true_next_obs = torch.where(
-            dones[:, None] > 0, infos["observations"]["raw"]["obs"], next_obs
-        )
+        # raw differs from next_obs only at truncations, which are always done.
+        true_next_obs = infos["observations"]["raw"]["obs"]
         if envs.asymmetric_obs:
             true_next_critic_obs = torch.where(
                 dones[:, None] > 0,
@@ -837,13 +867,22 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             for i in range(args.num_updates):
                 if not ready_buffers:
                     break
-                data = torch.cat([
-                    rb.sample(max(1, args.batch_size // args.num_envs))
-                    for rb in ready_buffers
-                ], dim=0)
-                sample_valid = data.pop("_valid")
-                sample_indices = sample_valid.nonzero(as_tuple=True)[0]
-                data = data[sample_indices.to(device, non_blocking=True)]
+                if replay_batch is not None:
+                    offset = 0
+                    for rb in ready_buffers:
+                        end = offset + rb.n_env * samples_per_agent
+                        sampled = rb.sample(
+                            samples_per_agent, out=replay_batch[offset:end]
+                        )
+                        offset += sampled.numel()
+                    data = replay_batch[:offset]
+                else:
+                    data = torch.cat([
+                        rb.sample(samples_per_agent) for rb in ready_buffers
+                    ], dim=0)
+                    sample_valid = data.pop("_valid")
+                    sample_indices = sample_valid.nonzero(as_tuple=True)[0]
+                    data = data[sample_indices.to(device, non_blocking=True)]
                 if data.numel() == 0:
                     continue
                 data["observations"] = normalize_obs(data["observations"])

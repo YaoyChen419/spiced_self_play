@@ -131,8 +131,12 @@ class SimpleReplayBuffer(nn.Module):
         self.ptr += 1
 
     @torch.no_grad()
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, out: Optional[TensorDict] = None):
         # we will sample n_env * batch_size transitions
+        if out is not None and (
+            self.n_steps != 1 or self.asymmetric_obs or self.valid.device.type != "cpu"
+        ):
+            raise ValueError("Output-buffer sampling requires one-step symmetric replay with CPU validity")
 
         if self.n_steps == 1:
             valid_indices = torch.randint(
@@ -141,6 +145,28 @@ class SimpleReplayBuffer(nn.Module):
                 (self.n_env, batch_size),
                 device=self.valid.device,
             )
+            if out is not None:
+                # Select valid slots before reading large tensors, as in SB3 replay.
+                valid = self.valid.gather(1, valid_indices)
+                rows = torch.arange(self.n_env, device=self.valid.device)[:, None]
+                flat_indices = (rows * self.buffer_size + valid_indices)[valid]
+                out = out[:flat_indices.numel()]
+                if flat_indices.numel() == 0:
+                    return out
+                flat_indices = flat_indices.to(self.observations.device, non_blocking=True)
+                for key, storage in (
+                    ("observations", self.observations),
+                    ("actions", self.actions),
+                    (("next", "observations"), self.next_observations),
+                    (("next", "rewards"), self.rewards),
+                    (("next", "dones"), self.dones),
+                    (("next", "truncations"), self.truncations),
+                ):
+                    torch.index_select(
+                        storage.flatten(0, 1), 0, flat_indices, out=out[key]
+                    )
+                out["next", "effective_n_steps"].fill_(1)
+                return out
             indices = valid_indices.to(self.observations.device, non_blocking=True)
             obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
