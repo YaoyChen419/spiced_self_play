@@ -137,25 +137,24 @@ class PufferDriveEnv:
         valid = torch.as_tensor(valid_cpu, device=self.device, dtype=torch.bool)
 
         raw_observations = observations.copy()
-        offset = 0
         transitions = []
         for info in infos:
             if "_fasttd3_transition" in info:
                 transitions.append(info["_fasttd3_transition"])
 
-        transition_rows = np.flatnonzero(transition_ready)
-        for transition in transitions:
-            count = transition["count"]
-            indices = transition_rows[transition["indices"] + offset]
-            raw_observations[indices] = transition["observations"]
-            offset += count
-
-        if transitions and offset != len(transition_rows):
-            raise RuntimeError(
-                f"FastTD3 final-observation metadata covers {offset} agents, "
-                f"but the received batch contains {len(transition_rows)} transitions"
+        truncated_rows = np.flatnonzero(truncations & transition_ready)
+        if transitions:
+            # Vector infos and agent rows share the same worker/environment order.
+            final_obs = np.concatenate(
+                [transition["observations"] for transition in transitions], axis=0
             )
-        if np.any(truncations[transition_ready]) and not transitions:
+            if len(final_obs) != len(truncated_rows):
+                raise RuntimeError(
+                    f"FastTD3 final-observation metadata covers {len(final_obs)} agents, "
+                    f"but the received batch contains {len(truncated_rows)} truncations"
+                )
+            raw_observations[truncated_rows] = final_obs
+        elif truncated_rows.size:
             raise RuntimeError(
                 "Drive truncated without providing FastTD3 final observations"
             )
