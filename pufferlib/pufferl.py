@@ -1827,6 +1827,14 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
     actor_state = checkpoint["actor_state_dict"]
     n_obs = actor_state["net.0.weight"].shape[-1]
     n_act = actor_state["fc_mu.0.weight"].shape[0]
+    if vecenv.single_action_space.dtype != np.float32:
+        raise pufferlib.APIUsageError("FastTD3 requires a continuous float32 action space")
+    if vecenv.single_observation_space.shape != (n_obs,) or vecenv.single_action_space.shape != (n_act,):
+        raise pufferlib.APIUsageError(
+            f"FastTD3 checkpoint expects obs/actions {(n_obs, n_act)}, "
+            f"but the environment provides {vecenv.single_observation_space.shape}/"
+            f"{vecenv.single_action_space.shape}"
+        )
 
     actor = Actor(
         n_obs=n_obs,

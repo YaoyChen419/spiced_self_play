@@ -599,6 +599,7 @@ struct Drive {
     IDMAgentState *idm_agent_states;
 };
 
+static void capture_final_observation(Drive *env, int agent_idx);
 static void idm_load_extension(FILE *file, Drive *env);
 static void idm_shift_map(Drive *env, float mean_x, float mean_y);
 static void idm_free(Drive *env);
@@ -1476,6 +1477,8 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             agent->vx = agent->vy = 0.0f;
         } else if (env->collision_behavior == REMOVE_AGENT && !agent->removed) {
             Entity *agent_collided = &env->entities[car_collided_with_index];
+            capture_final_observation(env, agent_idx);
+            capture_final_observation(env, car_collided_with_index);
             agent->removed = 1;
             agent_collided->removed = 1;
             agent->x = agent->y = -10000.0f;
@@ -1488,6 +1491,7 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             agent->stopped = 1;
             agent->vx = agent->vy = 0.0f;
         } else if (env->offroad_behavior == REMOVE_AGENT && !agent->removed) {
+            capture_final_observation(env, agent_idx);
             agent->removed = 1;
             agent->x = agent->y = -10000.0f;
         }
@@ -2225,14 +2229,18 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
     }
 }
 
-void compute_observations(Drive *env) {
+static void compute_observations_range(Drive *env, int start, int end) {
     int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
-    memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
+    memset(env->observations + start * max_obs, 0, max_obs * (end - start) * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
-    for (int i = 0; i < env->active_agent_count; i++) {
+    for (int i = start; i < end; i++) {
         float *obs = &observations[i][0];
         Entity *ego_entity = &env->entities[env->active_agent_indices[i]];
+        if (env->final_observations && ego_entity->removed) {
+            memcpy(obs, env->final_observations + i * max_obs, max_obs * sizeof(float));
+            continue;
+        }
         if (ego_entity->type > 3)
             break;
 
@@ -2355,7 +2363,7 @@ void compute_observations(Drive *env) {
             Entity *entity = &env->entities[entity_idx];
 
             // Validate geometry_idx before accessing
-            if (geometry_idx < 0 || geometry_idx >= entity->array_size) {
+            if (geometry_idx < 0 || geometry_idx + 1 >= entity->array_size) {
                 printf("ERROR: Invalid geometry_idx %d for entity %d (max: %d)\n", geometry_idx, entity_idx,
                        entity->array_size - 1);
                 continue;
@@ -2397,6 +2405,27 @@ void compute_observations(Drive *env) {
         int remaining_obs = (MAX_ROAD_SEGMENT_OBSERVATIONS - list_size) * 7;
         // Set the entire block to 0 at once
         memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
+    }
+}
+
+void compute_observations(Drive *env) {
+    compute_observations_range(env, 0, env->active_agent_count);
+}
+
+static void capture_final_observation(Drive *env, int agent_idx) {
+    if (!env->final_observations)
+        return;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        if (env->active_agent_indices[i] == agent_idx) {
+            env->terminals[i] = 1;
+            compute_observations_range(env, i, i + 1);
+            int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES;
+            int obs_dim = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) +
+                          ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+            memcpy(env->final_observations + i * obs_dim, env->observations + i * obs_dim,
+                   obs_dim * sizeof(float));
+            return;
+        }
     }
 }
 
@@ -2758,6 +2787,16 @@ void c_step(Drive *env) {
             if (env->entities[agent_idx].rear_collision_state) {
                 env->logs[i].rear_collision_rate = 1.0f;
             }
+        }
+    }
+
+    // Capture only newly completed agents, before removal changes their physical state.
+    if (env->final_observations && env->goal_behavior == GOAL_REMOVE) {
+        for (int i = 0; i < env->active_agent_count; i++) {
+            int agent_idx = env->active_agent_indices[i];
+            Entity *agent = &env->entities[agent_idx];
+            if (agent->current_goal_reached && !agent->removed)
+                capture_final_observation(env, agent_idx);
         }
     }
 
