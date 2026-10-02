@@ -921,6 +921,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
                 soft_update(qnet, qnet_target, args.tau)
 
+            if next_checkpoint_step is not None and agent_steps >= next_checkpoint_step:
+                print(f"Saving model at agent step {agent_steps}")
+                save_checkpoint()
+                next_checkpoint_step = (
+                    agent_steps // args.save_interval_agent_steps + 1
+                ) * args.save_interval_agent_steps
+
             eval_due = next_eval_step is not None and agent_steps >= next_eval_step
             if "actor_loss" in logs_dict and (
                 (global_step % 100 == 0 and start_time is not None) or eval_due
@@ -967,18 +974,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 last_log_time = now
                 last_log_agent_steps = agent_steps
 
-            if next_checkpoint_step is not None and agent_steps >= next_checkpoint_step:
-                print(f"Saving model at agent step {agent_steps}")
-                save_checkpoint()
-                next_checkpoint_step = (
-                    agent_steps // args.save_interval_agent_steps + 1
-                ) * args.save_interval_agent_steps
-
         global_step += 1
         actor_scheduler.step()
         q_scheduler.step()
         pbar.update(1)
 
+    final_path = save_checkpoint()
     final_logs = _mean_environment_stats(environment_stats)
     with torch.no_grad():
         if last_eval_agent_steps != agent_steps:
@@ -995,7 +996,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         final_logs["environment/perc_transitions_used"] = interval_valid.item() / interval_received
     logger.log(final_logs, step=agent_steps)
     all_logs.append(final_logs)
-    final_path = save_checkpoint()
     vecenv.close()
     logger.close(final_path)
     return all_logs

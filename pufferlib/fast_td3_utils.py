@@ -788,8 +788,8 @@ class PerTaskRewardNormalizer(nn.Module):
 
 
 def cpu_state(sd):
-    # detach & move to host without locking the compute stream
-    return {k: v.detach().to("cpu", non_blocking=True) for k, v in sd.items()}
+    # Serialization must wait until CUDA-to-host copies are complete.
+    return {k: v.detach().to("cpu") for k, v in sd.items()}
 
 
 def save_params(
