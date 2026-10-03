@@ -120,16 +120,13 @@ class RecurrentDriveCritic(Critic):
     def __init__(self, env, policy_kwargs, rnn_kwargs, **kwargs):
         kwargs['n_obs'] = rnn_kwargs['hidden_size']
         super().__init__(**kwargs)
-        self.encoders = nn.ModuleList(
-            DriveMemory(env, policy_kwargs, rnn_kwargs).to(self.device) for _ in range(2)
-        )
+        # ICML 2022 Critic_RNN: one memory backbone feeds two independent Q heads.
+        self.encoder = DriveMemory(env, policy_kwargs, rnn_kwargs).to(self.device)
 
     def forward(self, observations, actions):
-        return (self.qnet1(self.encoders[0](observations), actions),
-                self.qnet2(self.encoders[1](observations), actions))
+        return Critic.forward(self, self.encoder(observations), actions)
 
     def projection(self, observations, actions, rewards, bootstrap, discount):
-        return tuple(qnet.projection(
-            encoder(observations), actions, rewards, bootstrap, discount,
-            self.q_support, self.q_support.device,
-        ) for qnet, encoder in zip((self.qnet1, self.qnet2), self.encoders))
+        return Critic.projection(
+            self, self.encoder(observations), actions, rewards, bootstrap, discount,
+        )

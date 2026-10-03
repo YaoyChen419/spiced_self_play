@@ -246,6 +246,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     vecenv = vecenv or load_env(env_name, full_args)
     args.num_envs = vecenv.observation_space.shape[0]
     args.save_interval_agent_steps = args.save_interval * args.num_envs
+    # rollout_batch_size counts collected agent steps; batch_size counts replay loss steps.
+    rollout_batch_size = train_config.get('rollout_batch_size', args.num_envs)
+    if rollout_batch_size <= 0:
+        raise pufferlib.APIUsageError('rollout_batch_size must be positive')
     total_agent_timesteps = args.total_timesteps
     args.total_timesteps = math.ceil(total_agent_timesteps / args.num_envs)
 
@@ -522,7 +526,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         }, batch_size=[capacity], device=device)
 
     if recurrent:
-        sequences_per_worker = max(1, args.batch_size // (args.num_envs // agents_per_worker * args.rollout_horizon))
         lstm_h = torch.zeros(vecenv.num_agents, actor.hidden_size, device=device)
         lstm_c = torch.zeros_like(lstm_h)
 
@@ -733,6 +736,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         checkpoint_recurrent = 'encoder.lstm.weight_ih_l0' in torch_checkpoint['actor_state_dict']
         if checkpoint_recurrent != recurrent:
             raise pufferlib.APIUsageError('Checkpoint memory architecture differs; start a new run or match rnn_name')
+        if recurrent and 'encoders.0.lstm.weight_ih_l0' in torch_checkpoint['qnet_state_dict']:
+            raise pufferlib.APIUsageError('Checkpoint has independent Critic memories; start a new run for shared memory')
         actor.load_state_dict(torch_checkpoint["actor_state_dict"])
         obs_normalizer.load_state_dict(torch_checkpoint["obs_normalizer_state"])
         critic_obs_normalizer.load_state_dict(
@@ -756,6 +761,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         (agent_steps // args.save_interval_agent_steps + 1) * args.save_interval_agent_steps
         if args.save_interval_agent_steps > 0 else None
     )
+    next_train_step = (agent_steps // rollout_batch_size + 1) * rollout_batch_size
     dones = None
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     run_start_time = time.time()
@@ -913,12 +919,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if envs.asymmetric_obs:
             critic_obs = next_critic_obs
 
-        if global_step > args.learning_starts:
-            ready_buffers = [
+        if global_step > args.learning_starts and agent_steps >= next_train_step:
+            # A rollout spans multiple asynchronous workers; sample all completed trajectories.
+            ready_buffers = ([rb for rb in replay_buffers if rb.ready] if recurrent else [
                 replay_buffers[worker_id] for worker_id in worker_ids
-                if (replay_buffers[worker_id].ready if recurrent
-                    else replay_buffers[worker_id].ptr >= args.num_steps)
-            ]
+                if replay_buffers[worker_id].ptr >= args.num_steps
+            ])
+            if recurrent and ready_buffers:
+                sequences_per_worker = max(1, args.batch_size // (len(ready_buffers) * args.rollout_horizon))
             for i in range(args.num_updates):
                 if not ready_buffers:
                     break
@@ -985,6 +993,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
                 soft_update(qnet, qnet_target, args.tau)
 
+            if 'qf_loss' in logs_dict:
+                next_train_step = (agent_steps // rollout_batch_size + 1) * rollout_batch_size
+
             if next_checkpoint_step is not None and agent_steps >= next_checkpoint_step:
                 print(f"Saving model at agent step {agent_steps}")
                 save_checkpoint()
@@ -993,9 +1004,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 ) * args.save_interval_agent_steps
 
             eval_due = next_eval_step is not None and agent_steps >= next_eval_step
-            if "actor_loss" in logs_dict and (
-                (global_step % 100 == 0 and start_time is not None) or eval_due
-            ):
+            if "actor_loss" in logs_dict and (start_time is not None or eval_due):
                 now = time.time()
                 sps = (agent_steps - last_log_agent_steps) / (now - last_log_time)
                 pbar.set_description(f"{sps: 4.4f} sps, " + desc)
