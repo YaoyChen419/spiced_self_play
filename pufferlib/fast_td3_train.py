@@ -185,6 +185,7 @@ class PufferDriveEnv:
                 ),
             )
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
+        rewards = torch.clamp(rewards, -1, 1)
         terminals = torch.as_tensor(transition_terminals, device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         dones = terminals | truncations
