@@ -825,7 +825,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             if recurrent:
                 state = dict(lstm_h=lstm_h[current_ids], lstm_c=lstm_c[current_ids])
                 actions = policy(obs=norm_obs, dones=dones, state=state)
-                lstm_h[current_ids], lstm_c[current_ids] = state['lstm_h'], state['lstm_c']
+                lstm_h[current_ids] = state['lstm_h'].to(lstm_h.dtype)
+                lstm_c[current_ids] = state['lstm_c'].to(lstm_c.dtype)
             else:
                 actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
@@ -922,7 +923,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 if not ready_buffers:
                     break
                 if recurrent:
-                    data = torch.cat([rb.sample(sequences_per_worker) for rb in ready_buffers], dim=1)
+                    samples = [rb.sample(sequences_per_worker) for rb in ready_buffers]
+                    data = torch.cat([sample[0] for sample in samples], dim=1)
+                    sequence_mask = torch.cat([sample[1] for sample in samples], dim=1)
                 elif replay_batch is not None:
                     offset = 0
                     for rb in ready_buffers:
@@ -964,18 +967,21 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     data["next"]["rewards"] = normalize_reward(raw_rewards)
 
                 if recurrent:
-                    data = sequence_batch(data)
+                    data = sequence_batch(data, sequence_mask)
                 elif args.compile:
                     # Expose tensor batch dimensions without TensorDict batch-size metadata.
                     data = data.to_dict()
 
                 logs_dict = update_main(data, logs_dict)
-                if args.num_updates > 1:
-                    if i % args.policy_frequency == 1:
+                update_actor = (i % args.policy_frequency == 1 if args.num_updates > 1
+                                else global_step % args.policy_frequency == 0)
+                if update_actor:
+                    # Standard TD3: keep dQ/da, omit unused Critic parameter gradients.
+                    qnet.requires_grad_(False)
+                    try:
                         logs_dict = update_pol(data, logs_dict)
-                else:
-                    if global_step % args.policy_frequency == 0:
-                        logs_dict = update_pol(data, logs_dict)
+                    finally:
+                        qnet.requires_grad_(True)
 
                 soft_update(qnet, qnet_target, args.tau)
 

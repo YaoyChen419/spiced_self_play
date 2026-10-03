@@ -59,10 +59,11 @@ class DriveMemory(LSTMWrapper):
 
     def forward(self, observations):
         state = dict(lstm_h=None, lstm_c=None)
-        super().forward(observations.sequence.transpose(0, 1), state)
-        hidden = state['hidden'].transpose(0, 1)
-        start = observations.offset
-        return hidden[start:start + observations.mask.shape[0]][observations.mask]
+        if isinstance(observations, SequenceObservations):
+            hidden, _ = super().forward(observations.sequence, state)
+            return hidden.index_select(0, observations.indices)
+        hidden, _ = super().forward(observations, state)
+        return hidden
 
 
 class RecurrentDriveActor(Actor):
@@ -74,10 +75,12 @@ class RecurrentDriveActor(Actor):
         self.encoder = DriveMemory(env, policy_kwargs, rnn_kwargs).to(self.device)
         self.hidden_size = rnn_kwargs['hidden_size']
 
-    def forward(self, observations):
+    def forward(self, observations, state=None):
         if isinstance(observations, SequenceObservations):
-            observations = self.encoder(observations)
-        return super().forward(observations)
+            return super().forward(self.encoder(observations))
+        if state is None:
+            state = dict(lstm_h=None, lstm_c=None)
+        return self.forward_eval(observations, state)[0]
 
     def _encode_step(self, observations, state, dones):
         if dones is not None:
@@ -90,12 +93,27 @@ class RecurrentDriveActor(Actor):
         hidden, values = self._encode_step(observations, state, state.get('done'))
         return super().forward(hidden), values
 
-    def explore(self, obs, dones=None, state=None):
+    def explore(self, obs, dones=None, deterministic=False, state=None):
         if state is None:
             raise ValueError('Recurrent exploration requires per-vehicle LSTM state')
+        # Actor.explore source, with only its forward call adapted to explicit memory.
+        if dones is not None and dones.sum() > 0:
+            new_scales = (
+                torch.rand(self.n_envs, 1, device=obs.device)
+                * (self.std_max - self.std_min)
+                + self.std_min
+            )
+            dones_view = dones.view(-1, 1) > 0
+            self.noise_scales.copy_(
+                torch.where(dones_view, new_scales, self.noise_scales)
+            )
+
         hidden, _ = self._encode_step(obs, state, dones)
-        # Native exploration, including noise-scale resampling, stays in Actor.explore.
-        return super().explore(hidden, dones)
+        act = super().forward(hidden)
+        if deterministic:
+            return act
+        noise = torch.randn_like(act) * self.noise_scales
+        return act + noise
 
 
 class RecurrentDriveCritic(Critic):

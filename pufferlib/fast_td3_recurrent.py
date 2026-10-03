@@ -14,21 +14,29 @@ from pufferlib.fast_td3_utils import SimpleReplayBuffer
 
 
 class SequenceObservations(NamedTuple):
-    sequence: torch.Tensor  # (T+1, B, obs), as in ModelFreeOffPolicy_Separate_RNN.update
-    mask: torch.Tensor  # (T, B)
-    offset: int  # current=0, next=1; both use the same observation history
+    sequence: torch.Tensor  # (B, T+1, obs), native SPiCED LSTMWrapper layout
+    indices: torch.Tensor  # valid steps in the wrapper's flattened (B * (T+1), H) output
 
 
-def sequence_batch(data):
-    """Flatten only valid loss steps; native FastTD3 means remain unchanged."""
-    mask = data['_valid']
-    sequence = torch.cat((data['observations'][:1], data['next', 'observations']), dim=0)
+def sequence_batch(data, mask):
+    """Prepare layout and valid-step indices once; keep native FastTD3 loss means."""
+    length, batch_size = mask.shape
+    steps = mask.flatten().nonzero(as_tuple=True)[0]
+    # Loss tensors retain (T, B) order; LSTMWrapper returns (B, T+1) order.
+    memory_steps = (steps % batch_size) * (length + 1) + steps // batch_size
+    indices = torch.stack((steps, memory_steps, memory_steps + 1)).to(data.device)
+    sequence = torch.cat((data['observations'][:1].transpose(0, 1),
+                          data['next', 'observations'].transpose(0, 1)), dim=1)
+
+    def select(value):
+        return value.flatten(0, 1).index_select(0, indices[0])
+
     return {
-        'observations': SequenceObservations(sequence, mask, 0),
-        'actions': data['actions'][mask],
+        'observations': SequenceObservations(sequence, indices[1]),
+        'actions': select(data['actions']),
         'next': {
-            'observations': SequenceObservations(sequence, mask, 1),
-            **{key: value[mask] for key, value in data['next'].items() if key != 'observations'},
+            'observations': SequenceObservations(sequence, indices[2]),
+            **{key: select(value) for key, value in data['next'].items() if key != 'observations'},
         },
     }
 
@@ -102,7 +110,7 @@ class SequenceReplayBuffer(SimpleReplayBuffer):
         absolute = self.ptr - 1 - (self.ptr - 1 - positions) % self.buffer_size
         absolute = absolute[:, None] + self._offsets[None, :self._sampled_seq_len]
         slots = absolute % self.buffer_size
-        mask = self._generate_masks(rows, slots, absolute).transpose(0, 1).to(self.device)
+        mask = self._generate_masks(rows, slots, absolute).transpose(0, 1)
         rows, slots = rows.to(self.device), slots.to(self.device)
 
         def gather(storage):
@@ -112,7 +120,6 @@ class SequenceReplayBuffer(SimpleReplayBuffer):
         return TensorDict({
             'observations': gather(self.observations),
             'actions': gather(self.actions),
-            '_valid': mask,
             'next': {
                 'observations': gather(self.next_observations),
                 'rewards': gather(self.rewards),
@@ -120,4 +127,4 @@ class SequenceReplayBuffer(SimpleReplayBuffer):
                 'truncations': gather(self.truncations),
                 'effective_n_steps': torch.ones_like(dones),
             },
-        }, batch_size=[self._sampled_seq_len, batch_size], device=self.device)
+        }, batch_size=[self._sampled_seq_len, batch_size], device=self.device), mask
