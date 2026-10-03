@@ -18,15 +18,18 @@ class SequenceObservations(NamedTuple):
     indices: torch.Tensor  # valid steps in the wrapper's flattened (B * (T+1), H) output
 
 
-def sequence_batch(data, mask):
+def sequence_batch(data, mask, initial_observations, obs_normalizer=None):
     """Prepare layout and valid-step indices once; keep native FastTD3 loss means."""
     length, batch_size = mask.shape
     steps = mask.flatten().nonzero(as_tuple=True)[0]
     # Loss tensors retain (T, B) order; LSTMWrapper returns (B, T+1) order.
     memory_steps = (steps % batch_size) * (length + 1) + steps // batch_size
     indices = torch.stack((steps, memory_steps, memory_steps + 1)).to(data.device)
-    sequence = torch.cat((data['observations'][:1].transpose(0, 1),
+    sequence = torch.cat((initial_observations[:, None],
                           data['next', 'observations'].transpose(0, 1)), dim=1)
+    if obs_normalizer is not None:
+        # Statistics are collected from live observations, not repeatedly from replay.
+        sequence = obs_normalizer(sequence.flatten(0, 1), update=False).view_as(sequence)
 
     def select(value):
         return value.flatten(0, 1).index_select(0, indices[0])
@@ -116,9 +119,9 @@ class SequenceReplayBuffer(SimpleReplayBuffer):
         def gather(storage):
             return storage[rows[:, None], slots].transpose(0, 1)
 
+        initial_observations = self.observations[rows, slots[:, 0]]
         dones = gather(self.dones)
         return TensorDict({
-            'observations': gather(self.observations),
             'actions': gather(self.actions),
             'next': {
                 'observations': gather(self.next_observations),
@@ -127,4 +130,4 @@ class SequenceReplayBuffer(SimpleReplayBuffer):
                 'truncations': gather(self.truncations),
                 'effective_n_steps': torch.ones_like(dones),
             },
-        }, batch_size=[self._sampled_seq_len, batch_size], device=self.device), mask
+        }, batch_size=[self._sampled_seq_len, batch_size], device=self.device), mask, initial_observations

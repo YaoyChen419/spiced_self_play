@@ -930,6 +930,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     samples = [rb.sample(sequences_per_worker) for rb in ready_buffers]
                     data = torch.cat([sample[0] for sample in samples], dim=1)
                     sequence_mask = torch.cat([sample[1] for sample in samples], dim=1)
+                    initial_observations = torch.cat([sample[2] for sample in samples], dim=0)
                 elif replay_batch is not None:
                     offset = 0
                     for rb in ready_buffers:
@@ -948,10 +949,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     data = data[sample_indices.to(device, non_blocking=True)]
                 if data.numel() == 0:
                     continue
-                data["observations"] = normalize_obs(data["observations"])
-                data["next"]["observations"] = normalize_obs(
-                    data["next"]["observations"]
-                )
+                if not recurrent:
+                    data["observations"] = normalize_obs(data["observations"])
+                    data["next"]["observations"] = normalize_obs(
+                        data["next"]["observations"]
+                    )
                 if envs.asymmetric_obs:
                     data["critic_observations"] = normalize_critic_obs(
                         data["critic_observations"]
@@ -971,7 +973,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     data["next"]["rewards"] = normalize_reward(raw_rewards)
 
                 if recurrent:
-                    data = sequence_batch(data, sequence_mask)
+                    data = sequence_batch(
+                        data, sequence_mask, initial_observations,
+                        normalize_obs if args.obs_normalization else None,
+                    )
                 elif args.compile:
                     # Expose tensor batch dimensions without TensorDict batch-size metadata.
                     data = data.to_dict()

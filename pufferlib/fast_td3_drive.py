@@ -57,8 +57,9 @@ class DriveMemory(LSTMWrapper):
     def __init__(self, env, policy_kwargs, rnn_kwargs):
         super().__init__(env, MemoryPolicy(env, **policy_kwargs), **rnn_kwargs)
 
-    def forward(self, observations):
-        state = dict(lstm_h=None, lstm_c=None)
+    def forward(self, observations, state=None):
+        if state is None:
+            state = dict(lstm_h=None, lstm_c=None)
         if isinstance(observations, SequenceObservations):
             hidden, _ = LSTMWrapper.forward(self, observations.sequence, state)
             return hidden.index_select(0, observations.indices)
@@ -78,6 +79,8 @@ class RecurrentDriveActor(Actor):
     def forward(self, observations, state=None):
         if isinstance(observations, SequenceObservations):
             return Actor.forward(self, self.encoder(observations))
+        if observations.ndim == len(self.encoder.obs_shape) + 2:
+            return Actor.forward(self, self.encoder(observations, state))
         if state is None:
             state = dict(lstm_h=None, lstm_c=None)
         return self.forward_eval(observations, state)[0]
