@@ -289,6 +289,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     else:
         n_critic_obs = n_obs
     action_low, action_high = -1.0, 1.0
+    args.n_obs = n_obs
+    if args.obs_normalization:
+        raise pufferlib.APIUsageError("Drive encoding requires raw observations; set obs_normalization=False")
 
     if args.obs_normalization:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
@@ -352,10 +355,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             actor_cls = MultiTaskActor
             critic_cls = MultiTaskCritic
         else:
-            from pufferlib.fast_td3 import Actor, Critic
+            from pufferlib.fast_td3_drive import DriveActor, DriveCritic
 
-            actor_cls = Actor
-            critic_cls = Critic
+            actor_cls = DriveActor
+            critic_cls = DriveCritic
+            actor_kwargs.update(env=vecenv.driver_env, policy_kwargs=full_args["policy"])
+            critic_kwargs.update(env=vecenv.driver_env, policy_kwargs=full_args["policy"])
 
         actor_kwargs.update(
             {

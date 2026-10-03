@@ -1825,7 +1825,13 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
     checkpoint = torch.load(load_path, map_location=device, weights_only=False)
     checkpoint_args = checkpoint["args"]
     actor_state = checkpoint["actor_state_dict"]
-    n_obs = actor_state["net.0.weight"].shape[-1]
+    drive_encoding = "net.0.ego_encoder.0.weight" in actor_state
+    n_obs = checkpoint_args["n_obs"] if drive_encoding else actor_state["net.0.weight"].shape[-1]
+    actor_kwargs = {}
+    if drive_encoding:
+        from pufferlib.fast_td3_drive import DriveActor as Actor
+
+        actor_kwargs = dict(env=vecenv.driver_env, policy_kwargs=checkpoint["full_args"]["policy"])
     n_act = actor_state["fc_mu.0.weight"].shape[0]
     if vecenv.single_action_space.dtype != np.float32:
         raise pufferlib.APIUsageError("FastTD3 requires a continuous float32 action space")
@@ -1848,6 +1854,7 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
         sim_dimension=checkpoint_args["sim_dimension"],
         seq_len=checkpoint_args["actor_seq_len"],
         device=device,
+        **actor_kwargs,
     )
     actor.load_state_dict(actor_state)
     actor.eval()
