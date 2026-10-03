@@ -60,9 +60,9 @@ class DriveMemory(LSTMWrapper):
     def forward(self, observations):
         state = dict(lstm_h=None, lstm_c=None)
         if isinstance(observations, SequenceObservations):
-            hidden, _ = super().forward(observations.sequence, state)
+            hidden, _ = LSTMWrapper.forward(self, observations.sequence, state)
             return hidden.index_select(0, observations.indices)
-        hidden, _ = super().forward(observations, state)
+        hidden, _ = LSTMWrapper.forward(self, observations, state)
         return hidden
 
 
@@ -77,7 +77,7 @@ class RecurrentDriveActor(Actor):
 
     def forward(self, observations, state=None):
         if isinstance(observations, SequenceObservations):
-            return super().forward(self.encoder(observations))
+            return Actor.forward(self, self.encoder(observations))
         if state is None:
             state = dict(lstm_h=None, lstm_c=None)
         return self.forward_eval(observations, state)[0]
@@ -87,11 +87,11 @@ class RecurrentDriveActor(Actor):
             for key in ('lstm_h', 'lstm_c'):
                 if state[key] is not None:
                     state[key] = state[key].masked_fill(dones.reshape(-1, 1).bool(), 0)
-        return self.encoder.forward_eval(observations, state)
+        return LSTMWrapper.forward_eval(self.encoder, observations, state)
 
     def forward_eval(self, observations, state):
         hidden, values = self._encode_step(observations, state, state.get('done'))
-        return super().forward(hidden), values
+        return Actor.forward(self, hidden), values
 
     def explore(self, obs, dones=None, deterministic=False, state=None):
         if state is None:
@@ -109,7 +109,7 @@ class RecurrentDriveActor(Actor):
             )
 
         hidden, _ = self._encode_step(obs, state, dones)
-        act = super().forward(hidden)
+        act = Actor.forward(self, hidden)
         if deterministic:
             return act
         noise = torch.randn_like(act) * self.noise_scales

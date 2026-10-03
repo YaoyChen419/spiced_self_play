@@ -1039,8 +1039,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 last_log_agent_steps = agent_steps
 
         global_step += 1
-        actor_scheduler.step()
-        q_scheduler.step()
+        # Use PyTorch's own first-step marker; keep the existing clock thereafter.
+        if getattr(actor_optimizer, '_opt_called', False):
+            actor_scheduler.step()
+        if getattr(q_optimizer, '_opt_called', False):
+            q_scheduler.step()
         pbar.update(1)
 
     final_path = save_checkpoint()
