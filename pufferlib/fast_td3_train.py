@@ -494,6 +494,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             },
         }, batch_size=[capacity], device=device)
 
+    use_cuda_graphs = (
+        args.compile and args.compile_mode == "reduce-overhead" and device.type == "cuda"
+    )
+    full_batch_size = args.num_envs * samples_per_agent
+
     policy_noise = args.policy_noise
     noise_clip = args.noise_clip
 
@@ -532,7 +537,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         return evaluator.collect_stats()
 
-    def update_main(data, logs_dict):
+    def update_main(data):
+        logs_dict = {}
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
@@ -617,7 +623,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logs_dict["qf_min"] = qf1_next_target_value.min().detach()
         return logs_dict
 
-    def update_pol(data, logs_dict):
+    def update_pol(data):
+        logs_dict = {}
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
@@ -667,10 +674,16 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 module.projection.__func__, recursive=False
             )
             module.projection = projection.__get__(module, type(module))
-        compile_mode = args.compile_mode
+        # Native FastTD3 graphs apply only to unchanged, full replay batches.
+        if use_cuda_graphs:
+            graph_update_main = torch.compile(update_main, mode="reduce-overhead", dynamic=False)
+            graph_update_pol = torch.compile(update_pol, mode="reduce-overhead", dynamic=False)
+        compile_mode = "default" if use_cuda_graphs else args.compile_mode
         update_main = torch.compile(update_main, mode=compile_mode, dynamic=True)
         update_pol = torch.compile(update_pol, mode=compile_mode, dynamic=True)
-        policy = torch.compile(policy, mode=None)
+        policy = torch.compile(
+            policy, mode="reduce-overhead" if use_cuda_graphs else None, dynamic=False
+        )
         normalize_obs = torch.compile(obs_normalizer.forward, mode=None, dynamic=True)
         normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None, dynamic=True)
         if args.reward_normalization:
@@ -763,7 +776,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     while agent_steps < total_agent_timesteps:
         mark_step()
-        logs_dict = TensorDict()
+        logs_dict = {}
         if (
             start_time is None
             and global_step >= args.measure_burnin + args.learning_starts
@@ -791,6 +804,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 actions = policy(obs=norm_obs, dones=dones, has_dones=envs.has_dones)
             else:
                 actions = policy(obs=norm_obs, dones=dones)
+            # Async replay retains actions across iterations; graph outputs cannot be borrowed.
+            if use_cuda_graphs:
+                actions = actions.clone()
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
@@ -921,11 +937,18 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 else:
                     data["next"]["rewards"] = normalize_reward(raw_rewards)
 
+                graph_update = use_cuda_graphs and data.numel() == full_batch_size
+                if graph_update:
+                    mark_step()
                 if args.compile:
-                    # Expose tensor batch dimensions without TensorDict batch-size metadata.
                     data = data.to_dict()
 
-                logs_dict = update_main(data, logs_dict)
+                # LeanRL-style updates return detached metrics instead of mutating a log input.
+                metrics = (graph_update_main if graph_update else update_main)(data)
+                logs_dict.update({
+                    key: value.clone() if graph_update else value
+                    for key, value in metrics.items()
+                })
                 update_actor = (
                     i % args.policy_frequency == 1
                     if args.num_updates > 1
@@ -933,7 +956,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 )
                 if update_actor:
                     qnet.requires_grad_(False)
-                    logs_dict = update_pol(data, logs_dict)
+                    metrics = (graph_update_pol if graph_update else update_pol)(data)
+                    logs_dict.update({
+                        key: value.clone() if graph_update else value
+                        for key, value in metrics.items()
+                    })
                     qnet.requires_grad_(True)
 
                 soft_update(qnet, qnet_target, args.tau)
