@@ -100,6 +100,7 @@ class PufferDriveEnv:
         self.agent_ids = agent_ids.copy()
         self.pending.clear()
         self.agent_dead.fill(False)
+        self.has_dones = False
         self.observations = torch.as_tensor(observations.copy(), device=self.device, dtype=torch.float)
         return self.observations
 
@@ -140,32 +141,27 @@ class PufferDriveEnv:
 
         final_rows, final_observations = [], []
         transition_terminals = terminals.copy()
-        offset = 0
+        covered = np.zeros(self.num_envs, dtype=bool)
         transitions = []
         for info in infos:
             if "_fasttd3_transition" in info:
                 transitions.append(info["_fasttd3_transition"])
 
-        transition_rows = np.flatnonzero(transition_ready)
         for transition in transitions:
-            count = transition["count"]
-            rows = transition_rows[offset:offset + count]
-            transition_terminals[rows] = transition["terminals"]
-            indices = rows[transition["indices"]]
+            start = transition.get("offset", 0)
+            end = start + transition["count"]
+            transition_terminals[start:end] = transition["terminals"]
+            indices = start + transition["indices"]
             if indices.size:
                 final_rows.append(indices)
                 final_observations.append(transition["observations"])
-            offset += count
+            covered[start:end] = True
 
-        if transitions and offset != len(transition_rows):
-            raise RuntimeError(
-                f"FastTD3 final-observation metadata covers {offset} agents, "
-                f"but the received batch contains {len(transition_rows)} transitions"
-            )
-        if np.any(truncations[transition_ready]) and not transitions:
+        if np.any(truncations & transition_ready & ~covered):
             raise RuntimeError(
                 "Drive truncated without providing FastTD3 final observations"
             )
+        self.has_dones = bool(transition_terminals.any() or truncations.any())
 
         # Keep validity on the host, where the environment already produces done flags.
         self.agent_dead[agent_ids] |= terminals & ~truncations
@@ -791,7 +787,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             else:
                 norm_obs = normalize_obs(obs)
             actor_detach.noise_scales.copy_(noise_scales_by_id[current_ids])
-            actions = policy(obs=norm_obs, dones=dones)
+            if args.agent == "fasttd3":
+                actions = policy(obs=norm_obs, dones=dones, has_dones=envs.has_dones)
+            else:
+                actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
@@ -927,12 +926,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                     data = data.to_dict()
 
                 logs_dict = update_main(data, logs_dict)
-                if args.num_updates > 1:
-                    if i % args.policy_frequency == 1:
-                        logs_dict = update_pol(data, logs_dict)
-                else:
-                    if global_step % args.policy_frequency == 0:
-                        logs_dict = update_pol(data, logs_dict)
+                update_actor = (
+                    i % args.policy_frequency == 1
+                    if args.num_updates > 1
+                    else global_step % args.policy_frequency == 0
+                )
+                if update_actor:
+                    qnet.requires_grad_(False)
+                    logs_dict = update_pol(data, logs_dict)
+                    qnet.requires_grad_(True)
 
                 soft_update(qnet, qnet_target, args.tau)
 

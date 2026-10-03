@@ -18,6 +18,14 @@ MAIN = 5
 INFO = 6
 
 
+def _offset_transition_infos(infos, offset):
+    # Keep sparse final-observation metadata aligned with the received agent batch.
+    for info in infos:
+        transition = info.get("_fasttd3_transition")
+        if transition is not None:
+            transition["offset"] = transition.get("offset", 0) + offset
+
+
 def recv_precheck(vecenv):
     if vecenv.flag != RECV:
         raise pufferlib.APIUsageError("Call reset before stepping")
@@ -150,6 +158,7 @@ class Serial:
 
             if i:
                 if isinstance(i, list):
+                    _offset_transition_infos(i, ptr)
                     self.infos.extend(i)
                 else:
                     self.infos.append(i)
@@ -484,8 +493,11 @@ class Multiprocessing:
         t = buf["truncations"][w_slice].ravel()
 
         infos = []
-        for i in s_range:
+        for batch_index, i in enumerate(s_range):
             if self.infos[i]:
+                _offset_transition_infos(
+                    self.infos[i], batch_index * self.agent_ids.shape[1]
+                )
                 infos.extend(self.infos[i])
                 self.infos[i] = []
 
@@ -623,6 +635,10 @@ class Ray:
         o, r, d, t, infos, ids, m = zip(*recvs)
         self.prev_env_id = env_id
 
+        for batch_index, worker_infos in enumerate(infos):
+            _offset_transition_infos(
+                worker_infos, batch_index * self.agent_ids.shape[1]
+            )
         infos = [i for ii in infos for i in ii]
 
         o = np.stack(o, axis=0).reshape(self.obs_batch_shape)

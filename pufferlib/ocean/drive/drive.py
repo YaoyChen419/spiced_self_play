@@ -425,15 +425,21 @@ class Drive(pufferlib.PufferEnv):
         binding.vec_step(self.c_envs)
 
         self.tick += 1
+        resample = (
+            self.needs_resampling and self.tick > 0
+            and self.resample_frequency > 0
+            and self.tick % self.resample_frequency == 0
+        )
         transition = None
         if self.capture_final_observations:
             indices = np.flatnonzero(self.truncations)
-            transition = dict(
-                count=self.num_agents,
-                indices=indices,
-                observations=self.final_observations[indices].copy(),
-                terminals=self.terminals.copy(),
-            )
+            if indices.size or resample:
+                transition = dict(
+                    count=self.num_agents,
+                    indices=indices,
+                    observations=self.final_observations[indices],
+                    terminals=self.terminals.copy(),
+                )
         info = []
         if self.tick % self.report_interval == 0:
             if per_env_logs:  # Get the stats for every separate env
@@ -445,15 +451,14 @@ class Drive(pufferlib.PufferEnv):
                 if log:
                     info.append(log)
 
-        if self.needs_resampling:
-            if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
-                # Resample batch of scenes used for training
-                if transition is not None:
-                    final_obs = self.observations.copy()
-                    final_obs[transition["indices"]] = transition["observations"]
-                    transition["indices"] = np.arange(self.num_agents)
-                    transition["observations"] = final_obs
-                self.resample_maps()
+        if resample:
+            # Preserve the old-map transition before replacing the scenes.
+            if transition is not None:
+                final_obs = self.observations.copy()
+                final_obs[transition["indices"]] = transition["observations"]
+                transition["indices"] = np.arange(self.num_agents)
+                transition["observations"] = final_obs
+            self.resample_maps()
         if transition is not None:
             info.append({"_fasttd3_transition": transition})
 

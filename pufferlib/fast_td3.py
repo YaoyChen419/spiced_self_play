@@ -311,8 +311,11 @@ class Actor(nn.Module):
         obs: torch.Tensor,
         dones: torch.Tensor = None,
         deterministic: bool = False,
+        has_dones: bool = None,
     ) -> torch.Tensor:
-        if dones is not None and dones.sum() > 0:
+        if dones is not None and (
+            dones.sum() > 0 if has_dones is None else has_dones
+        ):
             new_scales = (
                 torch.rand(self.n_envs, 1, device=obs.device)
                 * (self.std_max - self.std_min)
