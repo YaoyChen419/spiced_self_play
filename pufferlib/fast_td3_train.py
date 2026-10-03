@@ -186,6 +186,7 @@ class PufferDriveEnv:
             )
         rewards = torch.as_tensor(rewards.copy(), device=self.device, dtype=torch.float)
         rewards = torch.clamp(rewards, -1, 1)
+        episode_ends_cpu = transition_terminals | truncations
         terminals = torch.as_tensor(transition_terminals, device=self.device, dtype=torch.bool)
         truncations = torch.as_tensor(truncations.copy(), device=self.device, dtype=torch.bool)
         dones = terminals | truncations
@@ -199,6 +200,7 @@ class PufferDriveEnv:
             "received_count": received_count,
             "valid": valid,
             "valid_cpu": valid_cpu,
+            "episode_ends_cpu": episode_ends_cpu,
             "environment_infos": infos,
         }
         return observations, rewards, dones, info
@@ -290,6 +292,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         n_critic_obs = n_obs
     action_low, action_high = -1.0, 1.0
     args.n_obs = n_obs
+    recurrent = full_args['rnn_name'] is not None
+    if recurrent and args.num_steps != 1:
+        raise pufferlib.APIUsageError('Recurrent Drive currently requires num_steps=1')
     if args.obs_normalization:
         raise pufferlib.APIUsageError("Drive encoding requires raw observations; set obs_normalization=False")
 
@@ -359,6 +364,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
             actor_cls = DriveActor
             critic_cls = DriveCritic
+            if recurrent:
+                from pufferlib.fast_td3_drive import RecurrentDriveActor, RecurrentDriveCritic
+
+                actor_cls, critic_cls = RecurrentDriveActor, RecurrentDriveCritic
+                actor_kwargs['rnn_kwargs'] = full_args['rnn']
+                critic_kwargs['rnn_kwargs'] = full_args['rnn']
             actor_kwargs.update(env=vecenv.driver_env, policy_kwargs=full_args["policy"])
             critic_kwargs.update(env=vecenv.driver_env, policy_kwargs=full_args["policy"])
 
@@ -470,8 +481,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     # Each PufferLib worker owns continuous trajectories for its agent IDs.
     num_workers = getattr(vecenv, "num_workers", 1)
     agents_per_worker = vecenv.num_agents // num_workers
+    replay_cls, replay_kwargs = SimpleReplayBuffer, {}
+    if recurrent:
+        from pufferlib.fast_td3_recurrent import SequenceReplayBuffer, sequence_batch
+
+        replay_cls = SequenceReplayBuffer
+        replay_kwargs['sampled_seq_len'] = args.rollout_horizon
     replay_buffers = [
-        SimpleReplayBuffer(
+        replay_cls(
             n_env=agents_per_worker,
             buffer_size=args.buffer_size,
             n_obs=n_obs,
@@ -483,13 +500,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             gamma=args.gamma,
             device=device,
             valid_device="cpu",
+            **replay_kwargs,
         )
         for _ in range(num_workers)
     ]
 
     samples_per_agent = max(1, args.batch_size // args.num_envs)
     replay_batch = None
-    if args.num_steps == 1 and not envs.asymmetric_obs:
+    if not recurrent and args.num_steps == 1 and not envs.asymmetric_obs:
         capacity = args.num_envs * samples_per_agent
         replay_batch = TensorDict({
             "observations": torch.empty(capacity, n_obs, device=device),
@@ -502,6 +520,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 "effective_n_steps": torch.empty(capacity, device=device, dtype=torch.long),
             },
         }, batch_size=[capacity], device=device)
+
+    if recurrent:
+        sequences_per_worker = max(1, args.batch_size // (args.num_envs // agents_per_worker * args.rollout_horizon))
+        lstm_h = torch.zeros(vecenv.num_agents, actor.hidden_size, device=device)
+        lstm_c = torch.zeros_like(lstm_h)
 
     policy_noise = args.policy_noise
     noise_clip = args.noise_clip
@@ -707,6 +730,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         torch_checkpoint = torch.load(
             f"{args.checkpoint_path}", map_location=device, weights_only=False
         )
+        checkpoint_recurrent = 'encoder.lstm.weight_ih_l0' in torch_checkpoint['actor_state_dict']
+        if checkpoint_recurrent != recurrent:
+            raise pufferlib.APIUsageError('Checkpoint memory architecture differs; start a new run or match rnn_name')
         actor.load_state_dict(torch_checkpoint["actor_state_dict"])
         obs_normalizer.load_state_dict(torch_checkpoint["obs_normalizer_state"])
         critic_obs_normalizer.load_state_dict(
@@ -796,7 +822,12 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
             else:
                 norm_obs = normalize_obs(obs)
             actor_detach.noise_scales.copy_(noise_scales_by_id[current_ids])
-            actions = policy(obs=norm_obs, dones=dones)
+            if recurrent:
+                state = dict(lstm_h=lstm_h[current_ids], lstm_c=lstm_c[current_ids])
+                actions = policy(obs=norm_obs, dones=dones, state=state)
+                lstm_h[current_ids], lstm_c[current_ids] = state['lstm_h'], state['lstm_c']
+            else:
+                actions = policy(obs=norm_obs, dones=dones)
             noise_scales_by_id[current_ids] = actor_detach.noise_scales
 
         next_obs, rewards, dones, infos = envs.step(actions.float())
@@ -867,12 +898,14 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         expected_ids = worker_ids[:, None] * agents_per_worker + np.arange(agents_per_worker)
         if not np.array_equal(grouped_ids, expected_ids):
             raise RuntimeError("Replay requires complete, ordered PufferLib worker agent IDs")
-        for worker_id, worker_transition, worker_valid in zip(
+        for worker_id, worker_transition, worker_valid, worker_ends in zip(
             worker_ids, transition.split(agents_per_worker),
-            infos["valid_cpu"].reshape(-1, agents_per_worker),
+            infos['valid_cpu'].reshape(-1, agents_per_worker),
+            infos['episode_ends_cpu'].reshape(-1, agents_per_worker),
         ):
+            extra = {'ends': torch.from_numpy(worker_ends)} if recurrent else {}
             replay_buffers[worker_id].extend(
-                worker_transition, valid=torch.from_numpy(worker_valid)
+                worker_transition, valid=torch.from_numpy(worker_valid), **extra
             )
 
         obs = next_obs
@@ -882,12 +915,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if global_step > args.learning_starts:
             ready_buffers = [
                 replay_buffers[worker_id] for worker_id in worker_ids
-                if replay_buffers[worker_id].ptr >= args.num_steps
+                if (replay_buffers[worker_id].ready if recurrent
+                    else replay_buffers[worker_id].ptr >= args.num_steps)
             ]
             for i in range(args.num_updates):
                 if not ready_buffers:
                     break
-                if replay_batch is not None:
+                if recurrent:
+                    data = torch.cat([rb.sample(sequences_per_worker) for rb in ready_buffers], dim=1)
+                elif replay_batch is not None:
                     offset = 0
                     for rb in ready_buffers:
                         end = offset + rb.n_env * samples_per_agent
@@ -927,7 +963,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
                 else:
                     data["next"]["rewards"] = normalize_reward(raw_rewards)
 
-                if args.compile:
+                if recurrent:
+                    data = sequence_batch(data)
+                elif args.compile:
                     # Expose tensor batch dimensions without TensorDict batch-size metadata.
                     data = data.to_dict()
 

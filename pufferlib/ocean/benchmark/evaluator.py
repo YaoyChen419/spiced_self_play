@@ -216,10 +216,9 @@ class WOSACEvaluator:
             truncations = np.zeros((num_agents,), dtype=bool)
             state = {}
 
-            if (
-                args["train"]["use_rnn"]
-                and policy is not None
-                and obs_normalizer is None
+            if policy is not None and (
+                getattr(policy, 'is_recurrent', False)
+                or (args['train']['use_rnn'] and obs_normalizer is None)
             ):
                 state = dict(
                     lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -267,7 +266,10 @@ class WOSACEvaluator:
                                         ob_tensor,
                                         update=False,
                                     )
-                                action = policy(normalized_obs)
+                                if getattr(policy, 'is_recurrent', False):
+                                    action, _ = policy.forward_eval(normalized_obs, state)
+                                else:
+                                    action = policy(normalized_obs)
                             else:
                                 logits, value = policy.forward_eval(ob_tensor, state)
                                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
@@ -277,6 +279,8 @@ class WOSACEvaluator:
                             action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
                 obs, rewards, terminals, truncations, infos = puffer_env.step(action_np)
+                if getattr(policy, 'is_recurrent', False):
+                    state['done'] = torch.as_tensor(terminals | truncations, device=device)
 
         return trajectories
 
@@ -997,7 +1001,7 @@ class Evaluator:
 
         # Initialize RNN state if needed
         state = {}
-        if self.configs["train"]["use_rnn"] and obs_normalizer is None:
+        if getattr(policy, 'is_recurrent', False) or (self.configs['train']['use_rnn'] and obs_normalizer is None):
             state = dict(
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -1022,7 +1026,10 @@ class Evaluator:
                         normalized_obs = obs_normalizer(ob_tensor)
                     else:
                         normalized_obs = obs_normalizer(ob_tensor, update=False)
-                    action = policy(normalized_obs)
+                    if getattr(policy, 'is_recurrent', False):
+                        action, _ = policy.forward_eval(normalized_obs, state)
+                    else:
+                        action = policy(normalized_obs)
                 else:
                     logits, value = policy.forward_eval(ob_tensor, state)
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
@@ -1034,6 +1041,8 @@ class Evaluator:
 
             # Step environment
             obs, rewards, terminals, truncated, info_list = env.step(action_np, per_env_logs=per_env_logs)
+            if getattr(policy, 'is_recurrent', False):
+                state['done'] = torch.as_tensor(terminals | truncated, device=device)
 
             if truncated.all():
                 break

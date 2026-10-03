@@ -1414,7 +1414,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         device = args["train"]["device"]
 
         state = {}
-        if args["train"]["use_rnn"] and not fasttd3:
+        if getattr(policy, 'is_recurrent', False) or (args['train']['use_rnn'] and not fasttd3):
             state = dict(
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -1434,7 +1434,10 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                         normalized_ob = obs_normalizer(ob)
                     else:
                         normalized_ob = obs_normalizer(ob, update=False)
-                    action = policy(normalized_ob)
+                    if getattr(policy, 'is_recurrent', False):
+                        action, _ = policy.forward_eval(normalized_ob, state)
+                    else:
+                        action = policy(normalized_ob)
                 else:
                     logits, value = policy.forward_eval(ob, state)
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
@@ -1445,6 +1448,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
             ob, reward, terminal, truncated, info = vecenv.step(action)
+            if getattr(policy, 'is_recurrent', False):
+                state['done'] = torch.as_tensor(terminal | truncated, device=device)
 
             if driver.render_mode == 1:
                 frame_count += 1
@@ -1825,13 +1830,18 @@ def load_fasttd3_policy(args, vecenv, env_name=""):
     checkpoint = torch.load(load_path, map_location=device, weights_only=False)
     checkpoint_args = checkpoint["args"]
     actor_state = checkpoint["actor_state_dict"]
-    drive_encoding = "net.0.ego_encoder.0.weight" in actor_state
+    recurrent = 'encoder.lstm.weight_ih_l0' in actor_state
+    drive_encoding = recurrent or "net.0.ego_encoder.0.weight" in actor_state
     n_obs = checkpoint_args["n_obs"] if drive_encoding else actor_state["net.0.weight"].shape[-1]
     actor_kwargs = {}
     if drive_encoding:
         from pufferlib.fast_td3_drive import DriveActor as Actor
 
         actor_kwargs = dict(env=vecenv.driver_env, policy_kwargs=checkpoint["full_args"]["policy"])
+        if recurrent:
+            from pufferlib.fast_td3_drive import RecurrentDriveActor as Actor
+
+            actor_kwargs['rnn_kwargs'] = checkpoint['full_args']['rnn']
     n_act = actor_state["fc_mu.0.weight"].shape[0]
     if vecenv.single_action_space.dtype != np.float32:
         raise pufferlib.APIUsageError("FastTD3 requires a continuous float32 action space")
